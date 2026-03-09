@@ -20,8 +20,8 @@ beta     = 40.0   # inverse temperature  (T = 1/β = 0.025)
 w_max    = 20.0   # DLR energy cutoff
 eps_dlr  = 1e-9  # DLR accuracy
 
-n_target = 2.0    # half filling (2 electrons in 2 orbitals)
-norb     = 2
+n_target = 1.0    # half filling (2 electrons in 2 orbitals)
+norb     = 1
 
 gf_struct = [('up', norb), ('down', norb)]
 
@@ -37,19 +37,19 @@ gf_struct = [('up', norb), ('down', norb)]
 #                'down': np.diag([-1.0, -0.5])}
 #
 # Here we use a uniform kick (same shift on both orbitals):
-spin_kick = {
-    'up':   2*np.diag([+1.0,+1.0]),   # both orbitals spin-up shifted by +1
-    'down': 2*np.diag([+1.0,+1.0]), # both orbitals spin-down shifted by -1
-}
+# spin_kick = {
+#     'up':   8*np.diag([-1.0,-1.0]),   # both orbitals spin-up shifted by +1
+#     'down': 8*np.diag([-1.0,+1.0]), # both orbitals spin-down shifted by -1
+# }
 
 # ── U scan ──────────────────────────────────────────────────────────────────
 mpi.report('\n' + '='*70)
 mpi.report('  2-orbital Bethe lattice HF-DMFT  |  t={:.2f}  β={:.1f}'.format(t, beta))
 mpi.report('='*70 + '\n')
 
-U_values = [4.5]
+U_values = [6]
 
-J = 0.3
+J = 1
 
 results = {}
 for U in U_values:
@@ -78,7 +78,7 @@ for U in U_values:
         eps        = 1e-22,
         verbose    = True,
         adjust_mu  = True,
-        mu_bracket = 15.0,
+        mu_bracket = 75.0,
         # spin_kick  = spin_kick,  # set to None or 0.0 for paramagnetic start
         # ImpuritySolver.solve() kwargs:
         with_fock  = True,
@@ -92,7 +92,7 @@ for U in U_values:
     # Report spin polarisation  m = (n_up - n_down) / 2
     n_up   = res['density']['up'].diagonal().real
     n_down = res['density']['down'].diagonal().real
-    m      = (n_up - n_down) / 2.0
+    m      = (n_up - n_down) 
 
     mpi.report(
         f'  U={U:.1f}  μ={res["mu"]:+.4f}  '
@@ -348,16 +348,20 @@ import pandas as pd
 
 
 # ── Discovery hyper-parameters ───────────────────────────────────────────────
-N_DISCOVERY  = 512      # Sobol samples; power-of-2 keeps low-discrepancy ideal
+N_DISCOVERY  = 300     # Sobol samples; power-of-2 keeps low-discrepancy ideal
 OCCU_THRESH  = 0.10     # threshold to call an occupancy "close to 0 or 1"
 
 # Σ_HF elements sampling bounds:
 #   diagonal   : [−SIGMA_BOUND,        +SIGMA_BOUND       ]
 #   off-diagonal: [−SIGMA_OFFDIAG_BOUND, +SIGMA_OFFDIAG_BOUND]  (toned down)
 _U_disc            = U_values[-1]          # U from the last scan entry
-SIGMA_BOUND        = (2 * norb - 1) * _U_disc + 1.0
-SIGMA_OFFDIAG_FRAC = 0.5                 # off-diag range as fraction of diag range
+SIGMA_OFFSET = res['mu']
+SIGMA_BOUND        =  U/2
+SIGMA_OFFDIAG_FRAC = 0.2                # off-diag range as fraction of diag range
 SIGMA_OFFDIAG_BOUND = SIGMA_BOUND * SIGMA_OFFDIAG_FRAC
+
+SIGMA_UPPER = SIGMA_OFFSET + SIGMA_BOUND
+SIGMA_LOWER = SIGMA_OFFSET - SIGMA_BOUND
 
 _BORDER = '═' * 72
 _SEP    = '─' * 72
@@ -365,7 +369,7 @@ _SEP    = '─' * 72
 print(f"\n{_BORDER}")
 print(f"  STATE DISCOVERY  ─  Sobol-seeded HF landscape")
 print(f"  U = {_U_disc:.2f}  β = {beta:.0f}  n_orb = {norb}  N_samples = {N_DISCOVERY}")
-print(f"  Σ_HF diag    ∈ [−{SIGMA_BOUND:.2f}, +{SIGMA_BOUND:.2f}]")
+print(f"  Σ_HF diag    ∈ [{SIGMA_LOWER:.2f}, {SIGMA_UPPER:.2f}]")
 print(f"  Σ_HF off-diag∈ [−{SIGMA_OFFDIAG_BOUND:.2f}, +{SIGMA_OFFDIAG_BOUND:.2f}]  (×{SIGMA_OFFDIAG_FRAC} of diag)")
 print(f"{_BORDER}\n")
 
@@ -394,15 +398,15 @@ n_params     = 2 * n_per_block
 
 # Per-element bounds: first norb entries per block → diagonal, rest → off-diagonal
 _n_offdiag   = n_per_block - norb   # number of independent off-diag entries per block
-_lo_block    = [-SIGMA_BOUND]        * norb + [-SIGMA_OFFDIAG_BOUND] * _n_offdiag
-_hi_block    = [ SIGMA_BOUND]        * norb + [ SIGMA_OFFDIAG_BOUND] * _n_offdiag
+_lo_block    = [SIGMA_LOWER] * norb + [-SIGMA_OFFDIAG_BOUND] * _n_offdiag
+_hi_block    = [SIGMA_UPPER] * norb + [SIGMA_OFFDIAG_BOUND] * _n_offdiag
 _lo_bounds   = _lo_block + _lo_block   # both spin blocks
 _hi_bounds   = _hi_block + _hi_block
 
 _sampler     = qmc.Sobol(d=n_params, scramble=True, seed=42)
 _raw         = _sampler.random(N_DISCOVERY)          # in [0, 1]^d
 sigma_samples = qmc.scale(_raw, l_bounds=_lo_bounds, u_bounds=_hi_bounds)
-
+#%%
 # ── Converged bath Green's function and interaction term ──────────────────────
 G0_conv    = solver.G0_iw   # from the last DMFT run
 h_int_disc = h_int          # same Hamiltonian
@@ -437,8 +441,10 @@ for i_s, sigma_flat in enumerate(sigma_samples):
     # ── One self-consistent HF solve + observable collection ─────────────────
     _last_status = 'pending'
     try:
+        disc.dc_fixed_value = +1
         disc.solve(h_int_disc, with_fock=True, one_shot=False,
                    method='hybr', tol=1e-8)
+                #    method='linearmixing', tol=1e-8)
 
         # ── Collect observables ───────────────────────────────────────────────
         rho = {bl: disc.G_iw[bl].density().real for bl in ['up', 'down']}
@@ -448,14 +454,13 @@ for i_s, sigma_flat in enumerate(sigma_samples):
 
         # Per-orbital and mean magnetisation
         m_orb  = np.array([rho['up'][a, a] - rho['down'][a, a] for a in range(norb)])
-        m_mean = float(np.mean(m_orb))
+        m_mean = float(np.sum(m_orb))
 
         # Occupancies close to integer values
         all_occ  = np.array([rho[bl][a, a] for bl in ['up', 'down'] for a in range(norb)])
         n_close0 = int(np.sum(all_occ <       OCCU_THRESH))
         n_close1 = int(np.sum(all_occ > 1.0 - OCCU_THRESH))
 
-        # Free-energy proxy: exact HF interaction energy at fixed G0
         # F_int = float(np.real(disc.interaction_energy()))
         F_int = _impurity_free_energy(disc.G_iw, disc, disc.Sigma_HF, res['mu'], _U_disc, n_iw=5000)
 
@@ -575,7 +580,7 @@ sc = ax.scatter(
     zorder     = 3,
 )
 
-ax.set_ylim((-0.1,4))
+# ax.set_ylim((-0.1,1))
 
 
 cb = fig.colorbar(sc, ax=ax, pad=0.02)
@@ -584,8 +589,8 @@ cb.set_label('Total charge  n', fontsize=10)
 # Mark lowest-F solution
 _best = df_disc.iloc[0]
 ax.scatter([_best['m_mean']], [_best['F_int']-min(df_disc['F_int'])],
-           marker='*', s=280, color='gold', edgecolors='k',
-           linewidths=0.5, zorder=5, label=f'lowest F  (m={_best["m_mean"]:+.3f})')
+           marker='*', s=280, color='none', edgecolors='k', alpha=0.8,
+           linewidths=0.8, zorder=5, label=f'lowest F  (m={_best["m_mean"]:+.3f})')
 
 ax.axvline(0,  color='gray', lw=0.9, ls='--', alpha=0.55)
 ax.set_xlabel(r'Impurity magnetisation  $m = \langle n_\uparrow\rangle - \langle n_\downarrow\rangle$',
@@ -612,8 +617,14 @@ ax.legend(fontsize=fontsize_legend)
 ax.grid(True, alpha=0.3, lw=0.5)
 
 plt.tight_layout()
-plt.show()
 
+
+# save image to file
+
+imagename = f"n{norb}_nelec{n_target}_U{U}_J{J}.jpg"
+
+plt.savefig(imagename, dpi=300, bbox_inches='tight')
+plt.show()
 
 
 
