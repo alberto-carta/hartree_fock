@@ -87,6 +87,10 @@ class ImpuritySolver(object):
         self.dc_fixed_occ = None
         self.dc_fixed_value = None
 
+        # True if the last self-consistent solve converged; False if the root
+        # finder reported failure (solution may still be used as a warm start)
+        self.hf_converged = False
+
         # Here Sigma_HF gets initialized to numerical zeros
         # If you want to change this guess, use the method
         # reinitialize_sigma before calling the solve() method
@@ -273,7 +277,9 @@ class ImpuritySolver(object):
 
                 if root_finder['success']:
                     mpi.report('Self Consistent Hartree-Fock converged successfully, performing final iteration')
+                    self.hf_converged = True
                 else:
+                    self.hf_converged = False
                     mpi.report('Hartree-Fock solver did not converge successfully. Feeding last iteration as guess')
                     mpi.report(root_finder['message'])
 

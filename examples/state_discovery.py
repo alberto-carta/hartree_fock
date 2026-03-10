@@ -1,6 +1,9 @@
 #%%
 import os
 import sys
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
 
 # from run_2orb_bethe import G_iw
 
@@ -20,8 +23,9 @@ beta     = 40.0   # inverse temperature  (T = 1/β = 0.025)
 w_max    = 20.0   # DLR energy cutoff
 eps_dlr  = 1e-9  # DLR accuracy
 
-n_target = 1.0    # half filling (2 electrons in 2 orbitals)
-norb     = 1
+n_target = 5.0    # half filling (2 electrons in 2 orbitals)
+norb     = 5
+
 
 gf_struct = [('up', norb), ('down', norb)]
 
@@ -440,12 +444,18 @@ for i_s, sigma_flat in enumerate(sigma_samples):
 
     # ── One self-consistent HF solve + observable collection ─────────────────
     _last_status = 'pending'
-    try:
-        disc.dc_fixed_value = +1
-        disc.solve(h_int_disc, with_fock=True, one_shot=False,
-                   method='hybr', tol=1e-8)
-                #    method='linearmixing', tol=1e-8)
 
+    disc.dc_fixed_value = +1
+    disc.solve(h_int_disc, with_fock=True, one_shot=False,
+               method='hybr', tol=1e-8)
+            #    method='linearmixing', tol=1e-8)
+
+    if not disc.hf_converged:
+        n_failed += 1
+        if n_failed == 1:
+            print(f"  [!] First HF non-convergence at sample {i_s}")
+        _last_status = 'FAILED (HF not converged)'
+    else:
         # ── Collect observables ───────────────────────────────────────────────
         rho = {bl: disc.G_iw[bl].density().real for bl in ['up', 'down']}
 
@@ -463,7 +473,6 @@ for i_s, sigma_flat in enumerate(sigma_samples):
 
         # F_int = float(np.real(disc.interaction_energy()))
         F_int = _impurity_free_energy(disc.G_iw, disc, disc.Sigma_HF, res['mu'], _U_disc, n_iw=5000)
-
 
         # ── Build record ──────────────────────────────────────────────────────
         rec = dict(
@@ -483,12 +492,6 @@ for i_s, sigma_flat in enumerate(sigma_samples):
         records.append(rec)
         n_converged += 1
         _last_status = f"n={n_tot:.3f}  m={m_mean:+.4f}  F={F_int:.5f}"
-
-    except Exception as exc:
-        n_failed += 1
-        if n_failed == 1:
-            print(f"  [!] First failure at sample {i_s}: {type(exc).__name__}: {exc}")
-        _last_status = f"FAILED ({type(exc).__name__})"
 
     # ── Progress bar ─────────────────────────────────────────────────────────
     if (i_s + 1) % _progress_every == 0 or (i_s + 1) == N_DISCOVERY:
@@ -627,6 +630,329 @@ plt.savefig(imagename, dpi=300, bbox_inches='tight')
 plt.show()
 
 
+
+#%% Density-matrix targeting discovery
+# ══════════════════════════════════════════════════════════════════════════════
+#  Density-matrix targeting: propose random density matrices, drive the system
+#  toward them via an iterative Σ_HF constraint, then release and re-relax to
+#  find genuine self-consistent HF saddle points.
+#
+#  Algorithm:
+#  1. Build a target ρ_target[bl] per spin: diagonal matrix with eigenvalues
+#     in {0, 0.5, 1} (trace ≈ n_elec_spin), then rotated by a random SO(norb)
+#     matrix from scipy.stats.ortho_group.
+#  2. Run N_TARGET_ITER targeting steps:
+#       Σ ← Σ + α · (ρ[Σ] − ρ_target)
+#     This gradient-ascent update on the effective field drives the impurity
+#     density toward the target (higher Σ → lower occupation).
+#  3. Release the constraint: full self-consistent HF solve starting from the
+#     targeting Σ as the initial guess.
+#  4. Collect the same observables as the Sobol section above.
+# ══════════════════════════════════════════════════════════════════════════════
+
+from scipy.stats import ortho_group
+import pandas as pd
+
+# ── Hyper-parameters ─────────────────────────────────────────────────────────
+N_DM_TARGETS   = 400     # number of random density-matrix targets
+N_TARGET_ITER  = 30      # targeting iterations before releasing constraint
+# TARGET_ALPHA   = 2.0     # step size for Σ update toward target density matrix
+TARGET_ALPHA   = 0.5     # step size for Σ update toward target density matrix
+N_TARGET_SEED  = 123     # RNG seed for reproducibility
+HALF_OCC_PROB  = 0.10    # per-orbital probability of assigning occupation 0.5
+FORCE_REAL_DM  = True    # strip imaginary parts from Σ and G throughout targeting
+OCCU_THRESH  = 0.10     # threshold to call an occupancy "close to 0 or 1"
+
+
+
+_U_disc            = U_values[-1]          # U from the last scan entry
+
+
+# ── Helper: diagonal density matrix biased toward integer occupations ─────────
+def _make_diag_dm(n_elec_spin, nb, rng, half_occ_prob=HALF_OCC_PROB):
+    """
+    Return a diagonal (nb×nb) matrix with entries in {0, 0.5, 1}.
+
+    Strategy (strongly magnetization-friendly):
+      1. Each orbital draws Bernoulli(half_occ_prob): if hit → assigned 0.5.
+      2. Remaining orbitals are filled greedily with 1s then 0s to consume
+         the leftover charge  n_elec_spin − 0.5 × n_half  (rounded to int).
+      3. Orbital ordering is shuffled before returning so the SO(N) rotation
+         acts on a random permutation.
+
+    Parameters
+    ----------
+    n_elec_spin  : float   target electron count in this spin block
+    nb           : int     number of orbitals
+    rng          : np.random.Generator
+    half_occ_prob: float   per-orbital probability of occupation 0.5
+    """
+    eigs      = np.zeros(nb)
+    half_mask = rng.random(nb) < half_occ_prob
+    half_idx  = np.where(half_mask)[0]
+    free_idx  = np.where(~half_mask)[0]
+
+    eigs[half_idx] = 0.5
+
+    # electrons left for purely integer-occupied orbitals
+    n_free_elec = int(round(n_elec_spin - 0.5 * len(half_idx)))
+    n_free_elec = max(0, min(n_free_elec, len(free_idx)))
+
+    rng.shuffle(free_idx)
+    eigs[free_idx[:n_free_elec]] = 1.0     # rest stay 0
+
+    rng.shuffle(eigs)   # randomise ordering before SO(N) rotation
+    return np.diag(eigs)
+
+
+def _make_target_dm(n_elec_spin, nb, rng):
+    """
+    Return a random real symmetric density matrix with trace ≈ n_elec_spin,
+    constructed by rotating a biased-integer diagonal matrix with a random
+    SO(nb) matrix:  R @ diag @ R^T.
+    """
+    diag = _make_diag_dm(n_elec_spin, nb, rng)
+    if nb > 1:
+        R = ortho_group.rvs(nb, random_state=rng)
+        return R @ diag @ R.T
+    return diag
+
+
+# ── One targeting step: Σ ← Σ + α·(ρ[Σ] − ρ_target) ────────────────────────
+def _dm_targeting_step(G0_conv, Sigma_cur, rho_target, alpha, force_real=False):
+    """
+    Compute G[Σ] from G0 via Dyson equation, evaluate the density ρ[Σ],
+    and return an updated Σ that nudges the density toward ρ_target.
+
+    If force_real=True, imaginary parts of Σ are discarded after each update
+    so the trajectory stays in the real-symmetric subspace.
+
+    Returns updated Sigma dict and current density dict.
+    """
+    Sigma_new = {}
+    rho_cur   = {}
+    for bl, G0_bl in G0_conv:
+        G_bl          = inverse(inverse(G0_bl) - Sigma_cur[bl])
+        rho_cur[bl]   = G_bl.density().real
+        # positive alpha: if ρ > ρ_target, raise Σ to push occupation down
+        delta         = alpha * (rho_cur[bl] - rho_target[bl])
+        Sigma_new[bl] = Sigma_cur[bl] + (delta.real if force_real else delta)
+        if force_real:
+            Sigma_new[bl] = Sigma_new[bl].real.astype(float)
+    return Sigma_new, rho_cur
+
+
+# ── Set up ────────────────────────────────────────────────────────────────────
+rng_dm      = np.random.default_rng(N_TARGET_SEED)
+G0_conv_dm  = solver.G0_iw                        # converged bath from DMFT
+
+# Total electron count from the last DMFT solution; up/down proposals are
+# drawn by randomly splitting this integer so that magnetized states are
+# naturally covered (e.g. all-up / all-down / PM).
+_n_up_dmft   = float(np.trace(solver.G_iw['up'].density().real))
+_n_down_dmft = float(np.trace(solver.G_iw['down'].density().real))
+_n_total_int = int(round(_n_up_dmft + _n_down_dmft))   # conserved total
+
+records_dm  = []
+n_conv_dm   = 0
+n_fail_dm   = 0
+
+_BORDER_DM  = '═' * 72
+_SEP_DM     = '─' * 72
+
+print(f"\n{_BORDER_DM}")
+print(f"  DENSITY-MATRIX TARGETING  ─  SO({norb})-rotated {{0, 0.5, 1}} targets")
+print(f"  U = {_U_disc:.2f}  β = {beta:.0f}  n_orb = {norb}  N_targets = {N_DM_TARGETS}")
+print(f"  n_total = {_n_total_int}  (up/down split drawn randomly per target)")
+print(f"  P(half-occ) = {HALF_OCC_PROB:.0%}  │  Targeting iters = {N_TARGET_ITER}   α = {TARGET_ALPHA}")
+print(f"  force_real  = {FORCE_REAL_DM}")
+print(f"{_BORDER_DM}\n")
+
+_prog_every_dm = max(1, N_DM_TARGETS // 8)
+
+for i_t in range(N_DM_TARGETS):
+
+    # ── 1. Propose random target density matrices ─────────────────────────────
+    # Split n_total randomly between up and down to favour magnetized states.
+    # n_up is drawn uniformly from the feasible integer range, then
+    # n_down = n_total - n_up.  This covers PM, FM-up, FM-down and all
+    # intermediate configurations with equal probability.
+    _n_up_min  = max(0, _n_total_int - norb)
+    _n_up_max  = min(norb, _n_total_int)
+    n_up_prop   = int(rng_dm.integers(_n_up_min, _n_up_max + 1))
+    n_down_prop = _n_total_int - n_up_prop
+
+    rho_target = {
+        'up'  : _make_target_dm(n_up_prop,   norb, rng_dm),
+        'down': _make_target_dm(n_down_prop, norb, rng_dm),
+    }
+
+    # ── 2. Targeting loop: iterate Σ toward the target ─────────────────────────
+    _sigma_dtype = float if FORCE_REAL_DM else complex
+    Sigma_cur = {bl: np.zeros((norb, norb), dtype=_sigma_dtype) for bl in ['up', 'down']}
+    for _ in range(N_TARGET_ITER):
+        Sigma_cur, _ = _dm_targeting_step(G0_conv_dm, Sigma_cur, rho_target,
+                                          TARGET_ALPHA, force_real=FORCE_REAL_DM)
+
+    # ── 3. Re-relax: self-consistent HF starting from targeting Σ ─────────────
+    disc_dm = ImpuritySolver(
+        gf_struct  = gf_struct,
+        beta       = beta,
+        w_max      = w_max,
+        eps        = eps_dlr,
+        dc         = 'cFLL',
+        force_real = FORCE_REAL_DM,
+    )
+    for bl in ['up', 'down']:
+        disc_dm.G0_iw[bl].data[:] = G0_conv_dm[bl].data
+        # inject the targeting Σ; keep only real part when force_real is set
+        _sig = Sigma_cur[bl].real if FORCE_REAL_DM else Sigma_cur[bl].astype(complex)
+        disc_dm.Sigma_HF[bl] = _sig
+
+    disc_dm.dc_fixed_value = 0#+2
+    disc_dm.solve(h_int, with_fock=True, one_shot=False,
+                  method='hybr', tol=1e-8)
+
+    # ── 4. Collect observables ─────────────────────────────────────────────────
+    _last_dm = 'pending'
+    if not disc_dm.hf_converged:
+        n_fail_dm += 1
+        _last_dm = 'FAILED'
+    else:
+        rho_dm    = {bl: disc_dm.G_iw[bl].density().real for bl in ['up', 'down']}
+        n_tot_dm  = float(sum(np.trace(rho_dm[bl]) for bl in ['up', 'down']))
+        m_orb_dm  = np.array([rho_dm['up'][a, a] - rho_dm['down'][a, a] for a in range(norb)])
+        m_mean_dm = float(np.sum(m_orb_dm))
+
+        all_occ_dm  = np.array([rho_dm[bl][a, a] for bl in ['up', 'down'] for a in range(norb)])
+        n_close0_dm = int(np.sum(all_occ_dm <       OCCU_THRESH))
+        n_close1_dm = int(np.sum(all_occ_dm > 1.0 - OCCU_THRESH))
+
+        F_int_dm = _impurity_free_energy(disc_dm.G_iw, disc_dm, disc_dm.Sigma_HF,
+                                         res['mu'], _U_disc, n_iw=5000)
+
+        rec_dm = dict(
+            sample_id = i_t,
+            n_total   = n_tot_dm,
+            m_mean    = m_mean_dm,
+            F_int     = F_int_dm,
+            n_close_0 = n_close0_dm,
+            n_close_1 = n_close1_dm,
+        )
+        for a in range(norb):
+            for bl, tag in [('up', 'u'), ('down', 'd')]:
+                rec_dm[f'n{tag}{a}']    = float(rho_dm[bl][a, a])
+                rec_dm[f'Sig_{tag}{a}'] = float(np.real(disc_dm.Sigma_HF[bl][a, a]))
+            rec_dm[f'm{a}'] = float(m_orb_dm[a])
+
+        records_dm.append(rec_dm)
+        n_conv_dm += 1
+        _last_dm = f"n={n_tot_dm:.3f}  m={m_mean_dm:+.4f}  F={F_int_dm:.5f}"
+
+    # ── Progress bar ──────────────────────────────────────────────────────────
+    if (i_t + 1) % _prog_every_dm == 0 or (i_t + 1) == N_DM_TARGETS:
+        frac   = (i_t + 1) / N_DM_TARGETS
+        filled = int(frac * 20)
+        bar    = '█' * filled + '░' * (20 - filled)
+        print(f"  [{bar}]  {i_t+1:4d}/{N_DM_TARGETS}  ✓ {n_conv_dm}  ✗ {n_fail_dm}"
+              f"  │  last: {_last_dm}")
+
+# ── Assemble DataFrame ────────────────────────────────────────────────────────
+df_dm = pd.DataFrame(records_dm)
+if df_dm.empty:
+    print(f"\n  [!] No DM-targeting solutions converged — df_dm is empty.")
+else:
+    df_dm.sort_values('F_int', inplace=True, ignore_index=True)
+
+print(f"\n{_SEP_DM}")
+print(f"  {'DONE  (DM targeting)':^68}")
+print(f"  Converged : {n_conv_dm:4d}  │  Failed : {n_fail_dm:4d}  │  Total : {N_DM_TARGETS}")
+print(f"{_SEP_DM}")
+#%%
+
+
+
+plt.rcParams.update({'font.size': 12})
+fontsize_legend = 11
+fontsize_label = 14
+fontsize_title = 16
+
+# ── Descriptive statistics ────────────────────────────────────────────────────
+if not df_dm.empty:
+    _show_cols_dm = ['n_total', 'm_mean', 'F_int', 'n_close_0', 'n_close_1']
+    print(f"\n  Descriptive statistics (DM targeting):\n")
+    print(df_dm[_show_cols_dm].describe().round(5).to_string(index=True))
+
+    # ── Sorted top-30 table ───────────────────────────────────────────────────
+    print(f"\n{_SEP_DM}")
+    print(f"  Top-30 DM-targeting solutions by HF free energy  (★ = |m| > 0.05)\n")
+
+    _hdr_dm = (f"  {'#':>4}  {'n_tot':>7}  {'m':>8}  {'F_int':>12}"
+               + "".join(f"  {'nu'+str(a):>6}" for a in range(norb))
+               + "".join(f"  {'nd'+str(a):>6}" for a in range(norb))
+               + f"  {'c0':>4}  {'c1':>4}")
+    print(_hdr_dm)
+    print(f"  {_SEP_DM}")
+
+    for rank, row in enumerate(df_dm.head(30).itertuples(), start=1):
+        star   = '★' if abs(row.m_mean) > 0.05 else ' '
+        n_cols = "".join(f"  {row._asdict().get(f'nu{a}', 0.0):6.4f}" for a in range(norb))
+        d_cols = "".join(f"  {row._asdict().get(f'nd{a}', 0.0):6.4f}" for a in range(norb))
+        print(f"  {rank:4d}  {row.n_total:7.4f}  {row.m_mean:+8.4f}  {row.F_int:12.6f}"
+              f"{n_cols}{d_cols}"
+              f"  {row.n_close_0:4d}  {row.n_close_1:4d}  {star}")
+    print(f"{_SEP_DM}\n")
+
+    # ── Scatter plot ──────────────────────────────────────────────────────────
+    _f_dm  = df_dm['F_int'].values - df_dm['F_int'].min()
+    _n_dm  = df_dm['n_total'].values
+    _vmin_dm = max(0, _n_dm.mean() - 2 * _n_dm.std())
+    _vmax_dm = _n_dm.mean() + 2 * _n_dm.std()
+
+    fig_dm, axes_dm = plt.subplots(1, 2, figsize=(15, 5.5))
+    fig_dm.suptitle(
+        f"DM-targeting landscape  ─  U={_U_disc:.1f}  β={beta:.0f}  n_orb={norb}"
+        f"  │  {n_conv_dm}/{N_DM_TARGETS} converged",
+        fontsize=13, y=1.01
+    )
+
+    ax_l = axes_dm[0]
+    sc_dm = ax_l.scatter(
+        df_dm['m_mean'], _f_dm,
+        c=_n_dm, cmap='RdBu_r', vmin=_vmin_dm, vmax=_vmax_dm,
+        s=50, alpha=0.78, edgecolors='k', linewidths=1, zorder=3,
+    )
+    cb_dm = fig_dm.colorbar(sc_dm, ax=ax_l, pad=0.02)
+    cb_dm.set_label('Total charge  n', fontsize=10)
+    _best_dm = df_dm.iloc[0]
+    ax_l.scatter([_best_dm['m_mean']], [0.0],
+                 marker='*', s=280, color='none', edgecolors='k', alpha=0.8,
+                 linewidths=0.8, zorder=5,
+                 label=f'lowest F  (m={_best_dm["m_mean"]:+.3f})')
+    ax_l.axvline(0, color='gray', lw=0.9, ls='--', alpha=0.55)
+    ax_l.set_xlabel(r'Impurity magnetisation  $m$', fontsize=fontsize_label)
+    ax_l.set_ylabel(r'$\Delta F = F - F_{\min}$',    fontsize=fontsize_label)
+    ax_l.set_title('DM-targeting: discovered states', fontsize=fontsize_title)
+    ax_l.legend(fontsize=fontsize_legend)
+    ax_l.grid(True, alpha=0.3, lw=0.5)
+
+    ax_r = axes_dm[1]
+    ax_r.hist(_f_dm, bins=50, color='mediumpurple', edgecolor='k',
+              linewidth=0.35, alpha=0.82)
+    ax_r.axvline(0,           color='crimson',    lw=1.2, ls='--', label='lowest F')
+    ax_r.axvline(_f_dm.mean(), color='darkorange', lw=1.0, ls=':',
+                 label=f'mean  ΔF={_f_dm.mean():.3f}')
+    ax_r.set_xlabel(r'$\Delta F = F - F_{\min}$', fontsize=fontsize_label)
+    ax_r.set_ylabel('Count',                       fontsize=fontsize_label)
+    ax_r.set_title('Distribution of free energies (DM targeting)',
+                   fontsize=fontsize_title)
+    ax_r.legend(fontsize=fontsize_legend)
+    ax_r.grid(True, alpha=0.3, lw=0.5)
+
+    plt.tight_layout()
+    imagename_dm = f"dm_targeting_n{norb}_nelec{n_target}_U{U}_J{J}_Ntargets{N_DM_TARGETS}.jpg"
+    plt.savefig(imagename_dm, dpi=300, bbox_inches='tight')
+    plt.show()
 
 
 
