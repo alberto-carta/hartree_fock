@@ -81,7 +81,7 @@ for U in U_values:
         verbose    = True,
         adjust_mu  = True,
         mu_bracket = 25.0,
-        spin_kick  = spin_kick,  # set to None or 0.0 for paramagnetic start
+        # spin_kick  = spin_kick,  # set to None or 0.0 for paramagnetic start
         # ImpuritySolver.solve() kwargs:
         with_fock  = True,
         one_shot   = True,   # fully self-consistent HF within each DMFT step

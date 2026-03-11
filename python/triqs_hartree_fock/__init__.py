@@ -28,5 +28,20 @@ module containing Hartree-Fock lattice and impurity solvers
 
 from .impurity import ImpuritySolver
 from .lattice import LatticeSolver
+from .incoherent_ensemble_solver import (
+    IncoherentEnsembleSolver,
+    SobolSigmaProposals,
+    DensityMatrixProposals,
+    Solution,
+    SolutionSet,
+)
 
-__all__ = ["ImpuritySolver", "LatticeSolver"]
+__all__ = [
+    "ImpuritySolver",
+    "LatticeSolver",
+    "IncoherentEnsembleSolver",
+    "SobolSigmaProposals",
+    "DensityMatrixProposals",
+    "Solution",
+    "SolutionSet",
+]

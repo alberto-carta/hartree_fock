@@ -428,3 +428,229 @@ def dmft_loop_bethe_hf(solver, t, h_int, mu_init, n_target,
         'converged': converged,
         'solver':    solver,
     }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Ensemble DMFT loop (Bethe lattice)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def dmft_loop_ensemble_hf(
+    ensemble_solver,
+    dm_proposals,
+    h_int,
+    G0_iw,
+    t,
+    mu_init,
+    n_target,
+    n_elec_total,
+    max_iter: int = 10,
+    eps: float = 1e-3,
+    mix: float = 0.5,
+    adjust_mu: bool = True,
+    mu_bracket: float = 5.0,
+    with_fock: bool = True,
+    hf_method: str = 'hybr',
+    hf_tol: float = 1e-8,
+    seed: int = 42,
+    verbose: bool = True,
+):
+    """Run a Bethe-lattice DMFT self-consistency loop using the
+    :class:`IncoherentEnsembleSolver` as the impurity solver.
+
+    At each iteration the ensemble-averaged Green's function
+    ``G_ens(iω) = Σ_i w_i G_i(iω)`` plays the role of ``G_loc`` in the
+    Bethe self-consistency relation:
+
+        G0⁻¹(iω) = (iω + μ)·I − t²_α · G_ens,αα(iω)
+
+    The previous iteration's :class:`SolutionSet` is fed back into
+    ``dm_proposals.prior_solutions`` so that the next ensemble solve is
+    warm-started from already-discovered saddle points.
+
+    Parameters
+    ----------
+    ensemble_solver : IncoherentEnsembleSolver
+        Fully constructed solver instance (not yet solved; or may have been
+        solved previously – its state is overwritten each iteration).
+    dm_proposals    : DensityMatrixProposals
+        Proposal generator.  Its ``prior_solutions`` attribute is updated
+        in-place between iterations.
+    h_int           : triqs.operators.Operator
+        Local interaction Hamiltonian.
+    G0_iw           : BlockGf (DLR)
+        Starting bath Green's function (e.g. from a converged PM DMFT run).
+        The object is *not* modified; a working copy is maintained internally.
+    t               : float or array-like
+        Bethe-lattice hopping amplitude(s).  Same convention as
+        :func:`dmft_loop_bethe_hf`.
+    mu_init         : float
+        Starting chemical potential.
+    n_target        : float
+        Target total filling (Brentq target for μ adjustment).
+    n_elec_total    : float
+        Passed to ``ensemble_solver.solve()`` for DM proposal spin splits
+        (usually equal to ``n_target``).
+    max_iter        : int
+        Maximum number of ensemble-DMFT iterations (default 10).
+    eps             : float
+        Convergence threshold on  Σ_bl ‖ΔG_ens[bl]‖_F  (default 1e-3).
+    mix             : float
+        Linear mixing fraction for the bath G0 update:
+        G0 ← (1 − mix)·G0_old + mix·G0_Bethe.  Use values in (0, 1];
+        smaller values damp oscillations at the cost of slower convergence.
+        Default 0.5.
+    adjust_mu       : bool
+        Adjust μ via Brent's method after each ensemble solve.
+    mu_bracket      : float
+        Half-width of the μ search bracket.
+    with_fock       : bool
+        Include Fock terms in each inner HF solve.
+    hf_method       : str
+        scipy root-finder method for the inner HF self-consistency.
+    hf_tol          : float
+        Tolerance for the inner HF solver.
+    seed            : int
+        Base random seed; iteration ``it`` uses ``seed + it * 1000``.
+    verbose         : bool
+        Print per-iteration diagnostics.
+
+    Returns
+    -------
+    dict with keys
+        ``ensemble``  : the IncoherentEnsembleSolver (final state)
+        ``G0_iw``     : BlockGf – converged bath Green's function
+        ``mu``        : float – converged chemical potential
+        ``n_iter``    : int
+        ``converged`` : bool
+    """
+    from scipy.optimize import brentq
+
+    gf_struct   = ensemble_solver.gf_struct
+    block_names = [bl for bl, _ in gf_struct]
+    norb        = gf_struct[0][1]
+
+    t_arr  = np.broadcast_to(np.atleast_1d(np.asarray(t, dtype=float)), (norb,)).copy()
+    t2_mat = np.diag(t_arr ** 2)
+
+    mu     = float(mu_init)
+    G0_cur = G0_iw.copy()
+
+    def _update_G0(G_ens, mu_val):
+        """Overwrite G0_cur in-place: G0⁻¹[i] = (iω_i+μ)·I − t²·G_ens[i]."""
+        for bl in block_names:
+            for i, iw in enumerate(G0_cur[bl].mesh):
+                iw_v   = complex(iw)
+                G0_inv = (iw_v + mu_val) * np.eye(norb) - t2_mat @ G_ens[bl].data[i]
+                G0_cur[bl].data[i] = np.linalg.inv(G0_inv)
+
+    def _density_with_sigma(mu_val, Sigma_iw):
+        """Total local density at trial μ using the current ensemble Σ(iω).
+
+        G_trial⁻¹(iω) = G0⁻¹(iω; μ_trial) − Σ_ens(iω)
+                       = [(iω+μ)·I − t²·G_ens] − Σ_ens
+
+        This is the physically correct density for a correlated system:
+        the bath G0 alone gives the wrong answer in a Mott state.
+        """
+        n_tot = 0.0
+        for bl in block_names:
+            G_trial = G0_cur[bl].copy()
+            for i, iw in enumerate(G_trial.mesh):
+                iw_v   = complex(iw)
+                G0_inv = (iw_v + mu_val) * np.eye(norb) - t2_mat @ G_ens_cur[bl].data[i]
+                G_trial.data[i] = np.linalg.inv(G0_inv - Sigma_iw[bl].data[i])
+            n_tot += float(G_trial.total_density().real)
+        return n_tot
+    
+    # def density_from_G_ens(mu_val, G_ens):
+    #     """Helper to compute total density from the current G_ens at trial μ."""
+    #     G_new  = G_ens.copy()
+
+    #     G_new = inverse(invers
+
+    # G_ens_cur is set inside the loop before _density_with_sigma is called
+    G_ens_cur = G0_cur.copy()
+
+    G_ens_prev = None
+    converged  = False
+
+    for it in range(max_iter):
+        if verbose:
+            mpi.report(f'\n  {"─"*66}')
+            mpi.report(f'  Ensemble DMFT  iteration {it + 1}/{max_iter}   μ = {mu:+.6f}')
+            mpi.report(f'  {"─"*66}')
+
+        # ── Run ensemble solve on the current bath ─────────────────────────
+        for bl in block_names:
+            ensemble_solver.G0_iw[bl].data[:] = G0_cur[bl].data
+        ensemble_solver.solve(
+            h_int               = h_int,
+            proposal_generators = [dm_proposals],
+            mu                  = mu,
+            n_elec_total        = n_elec_total,
+            with_fock           = with_fock,
+            hf_method           = hf_method,
+            hf_tol              = hf_tol,
+            seed                = seed + it * 1000,
+        )
+
+        G_ens_cur  = ensemble_solver.G_iw
+        Sigma_cur  = ensemble_solver.Sigma_iw
+
+        # ── Measure local density from G_ens (the true observable) ─────────
+        n_ens = float(sum(
+            G_ens_cur[bl].total_density().real for bl in block_names))
+
+        # ── Optional μ adjustment via Brent on G_trial = (G0⁻¹ − Σ_ens)⁻¹ ─
+        # _density_with_sigma uses G_ens_cur and Sigma_cur (closed over above)
+        # so the Brent root-finder sees the correct correlated n(μ) curve.
+        if adjust_mu and abs(n_ens - n_target) > 1e-6:
+            def _f_brent(mu_t):
+                return _density_with_sigma(mu_t, Sigma_cur) - n_target
+            try:
+                mu = brentq(_f_brent,
+                             mu - mu_bracket, mu + mu_bracket,
+                             xtol=1e-6, maxiter=200)
+            except ValueError:
+                mpi.report(f'  WARNING: μ Brent bracket [{mu-mu_bracket:.4f}, '
+                           f'{mu+mu_bracket:.4f}] failed at iter {it+1}, '
+                           f'keeping μ = {mu:+.6f}')
+
+        # ── Update bath via Bethe SC (with mixing) ─────────────────────────
+        G0_old = G0_cur.copy()
+        _update_G0(G_ens_cur, mu)
+        if mix < 1.0:
+            for bl in block_names:
+                G0_cur[bl].data[:] = (1.0 - mix) * G0_old[bl].data + mix * G0_cur[bl].data
+
+        # ── Convergence check ──────────────────────────────────────────────
+        if G_ens_prev is not None:
+            delta_G = sum(
+                float(np.linalg.norm(G_ens_cur[bl].data - G_ens_prev[bl].data))
+                for bl in block_names
+            )
+            if verbose:
+                mpi.report(f'  n_ens = {n_ens:.5f}   μ = {mu:+.6f}'
+                           f'   ΔG_ens = {delta_G:.4e}   mix = {mix:.2f}')
+            if delta_G < eps:
+                converged = True
+                if verbose:
+                    mpi.report(f'  ✓ Ensemble DMFT converged after {it + 1} '
+                               f'iteration(s).')
+                break
+        else:
+            if verbose:
+                mpi.report(f'  n_ens = {n_ens:.5f}   μ = {mu:+.6f}   '
+                           f'(first iteration, no convergence check)')
+
+        # ── Warm-start next iteration ──────────────────────────────────────
+        dm_proposals.prior_solutions = ensemble_solver.solutions
+        G_ens_prev = G_ens_cur.copy()
+
+    return {
+        'ensemble'  : ensemble_solver,
+        'G0_iw'     : G0_cur,
+        'mu'        : mu,
+        'n_iter'    : it + 1,
+        'converged' : converged,
+    }
