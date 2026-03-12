@@ -49,13 +49,13 @@ plt.rcParams.update({'font.size': 12})
 # ══════════════════════════════════════════════════════════════════════════════
 #  Model parameters
 # ══════════════════════════════════════════════════════════════════════════════
-t        = 1.0      # Bethe-lattice hopping; half-bandwidth W = 2t
+t        = 1      # Bethe-lattice hopping; half-bandwidth W = 2t
 beta     = 40.0     # inverse temperature
 w_max    = 20.0     # DLR energy cutoff
 eps_dlr  = 1e-13     # DLR accuracy
 
-norb     = 2        # number of orbitals
-n_target = 2     # half-filling: norb electrons total
+norb     = 5        # number of orbitals
+n_target = 5     # half-filling: norb electrons total
 
 # U = 5.0
 # J = 0.3
@@ -64,8 +64,8 @@ n_target = 2     # half-filling: norb electrons total
 # norb     = 5        # number of orbitals
 # n_target = 5     # half-filling: norb electrons total
 
-U = 3.0
-J = 0.3
+U = 7.0
+J = 0.5
 
 
 gf_struct = [('up', norb), ('down', norb)]
@@ -78,17 +78,24 @@ mpi.report(f'  Step 1: PM HF-DMFT   |   norb={norb}   U={U}   J={J}   β={beta}'
 mpi.report('=' * 70 + '\n')
 
 # h_int = make_h_int_kanamori_simple(U, U, J, J, norb=norb)
-h_int = make_h_int_kanamori_simple(U, U - 2*J, J, 0, norb=norb)
-# h_int = make_h_int_kanamori_simple(U, U - 2*J, J, J, norb=norb) # this can generate a goldstone mode without crystal field
+# h_int = make_h_int_kanamori_simple(U, U - 2*J, J, 0, norb=norb)
+h_int = make_h_int_kanamori_simple(U, U - 2*J, J, J, norb=norb) # this can generate a goldstone mode without crystal field
 
-# from triqs.operators.operators import n, c_dag, c
-# if norb is 5 add a crystal field to the hamiltonian to break the degeneracy and avoid the goldstone mode
-# if norb == 5:
-#     delta = 0.2 # 200 meV crystal field is somewhat realistic
-#     for spin in ['up', 'down']:
-#         for orb in range(norb):
-#             if orb < 3:
-#                 h_int += delta * c_dag(spin, orb) * c(spin, orb)
+# ── Crystal field (optional) ─────────────────────────────────────────────────
+# Diagonal on-site energies per spin block, passed to both DMFT loops.
+# The field enters the Weiss field as:
+#   G0⁻¹(iω) = (iω + μ)·I − diag(ε_cf) − t²·G_loc(iω)
+#
+# Set to None to run without a crystal field (default, orbitally degenerate).
+
+cf_mag = 1
+cf_t2g = -2/5*cf_mag
+cf_eg  = 3/5*cf_mag
+
+crystal_field = {
+    'up':   np.array([cf_t2g, cf_t2g, cf_t2g, cf_eg, cf_eg]),
+    'down': np.array([cf_t2g, cf_t2g, cf_t2g, cf_eg, cf_eg]),
+}
 
 pm_solver = ImpuritySolver(
     gf_struct = gf_struct,
@@ -97,24 +104,26 @@ pm_solver = ImpuritySolver(
     eps       = eps_dlr,
     dc        = 'cFLL',
 )
+
 # mu_init = U
 
 pm_result = dmft_loop_bethe_hf(
-    solver    = pm_solver,
-    t         = t,
-    h_int     = h_int,
-    mu_init   = U,          # particle-hole symmetric starting point
-    n_target  = n_target,
-    max_iter  = 100,
-    mix       = 0.1,
-    eps       = 1e-12,
-    verbose   = True,
-    adjust_mu = True,
-    mu_bracket = 25.0,
-    with_fock = True,
-    one_shot  = True,
-    method    = 'hybr',
-    tol       = 1e-14,
+    solver        = pm_solver,
+    t             = t,
+    h_int         = h_int,
+    mu_init       = U,          # particle-hole symmetric starting point
+    n_target      = n_target,
+    max_iter      = 100,
+    mix           = 0.1,
+    eps           = 1e-12,
+    verbose       = True,
+    adjust_mu     = True,
+    mu_bracket    = 25.0,
+    crystal_field = crystal_field,
+    with_fock     = True,
+    one_shot      = True,
+    method        = 'hybr',
+    tol           = 1e-14,
 )
 
 mu = pm_result['mu']
@@ -131,6 +140,44 @@ mpi.report(f'  n_up   = {np.round(n_up, 4)}')
 mpi.report(f'  n_down = {np.round(n_down, 4)}')
 mpi.report(f'  m      = {np.round(n_up - n_down, 4)}')
 mpi.report('-' * 70 + '\n')
+
+
+#%%
+import matplotlib.pyplot as plt
+from triqs.gf import *
+from triqs.plot.mpl_interface import oplot
+pm_solver.G_iw
+
+oplot(pm_solver.G_iw['up'][0,0], '-o', label='G_up')
+
+
+# mesh_re = MeshReFreq(mesh=solver.G_iw.mesh)
+
+# Get back Green's function on the full Matsubara mesh, no Fourier transform needed
+Giw_from_dlr_up = make_gf_imfreq(pm_solver.G_iw['up'], n_iw=2500)
+Giw_from_dlr_down = make_gf_imfreq(pm_solver.G_iw['down'], n_iw=2500)
+
+oplot(Giw_from_dlr_up[0,0], '-', label='G_up from DLR')
+oplot(Giw_from_dlr_down[0,0], '-', label='G_down from DLR')
+
+plt.xlim(0, 20)
+
+#%%
+
+
+colorcycle = plt.rcParams['axes.prop_cycle'].by_key()['color']
+# set tau mesh and analytically continue to real freq
+Gw_up = Gf(mesh=MeshReFreq(window = (-5.0,5.0), n_w=1000), target_shape=[5,5])
+Gw_down = Gf(mesh=MeshReFreq(window = (-5.0,5.0), n_w=1000), target_shape=[5,5])
+Gw_up.set_from_pade(Giw_from_dlr_up, n_points = 1000)
+Gw_down.set_from_pade(Giw_from_dlr_down, n_points = 1000)
+
+oplot(-Gw_up[0,0].imag/np.pi, linewidth=2, color=colorcycle[0], label='00_up')
+oplot(-Gw_up[3,3].imag/np.pi, linewidth=2, color=colorcycle[1], label='11_up')
+oplot(Gw_down[0,0].imag/np.pi, linewidth=2, color=colorcycle[0], label='00_down')
+oplot(Gw_down[3,3].imag/np.pi, linewidth=2, color=colorcycle[1], label='11_down')
+plt.legend()
+
 
 
 #%%
@@ -153,10 +200,10 @@ mpi.report('=' * 70 + '\n')
 # )
 
 dm_proposals = DensityMatrixProposals(
-    n_proposals       = 50,
-    n_targeting_steps = 30,
-    # targeting_alpha   = 0.5,
-    targeting_alpha   = 2.0,
+    n_proposals       = 100,
+    n_targeting_steps = 50,
+    targeting_alpha   = 0.5,
+    # targeting_alpha   = 2.0,
     half_occ_prob     = 0.2,
     force_real        = True,
     # Explicit Hund's m=2 targets — all three orbital permutations of [1,1,0]/[0,0,0].
@@ -225,8 +272,7 @@ mpi.report('\n' + '=' * 70 + '\n')
 
 
 
-
-plot_dir = f'Plots_norb{norb}_U{U}_J{J}_beta{int(beta)}_ntarget{n_target}'
+plot_dir = f'Plots_norb{norb}_U{U}_J{J}_cf{cf_mag}_beta{int(beta)}'
 
 if not os.path.exists(plot_dir):
     os.makedirs(plot_dir)
@@ -239,7 +285,7 @@ landscape_fig = ensemble.plot_landscape(
     show      = False,
 )
 
-landscape_fig.suptitle(f'U={U} eV, J = {J} eV, beta = {beta} eV-1', fontsize=18)
+landscape_fig.suptitle(f'U={U} eV, J = {J} eV, cf = {cf_mag} eV, beta = {beta} eV-1', fontsize=18)
 
 axes = landscape_fig.axes
 
@@ -383,7 +429,7 @@ mpi.report('=' * 70 + '\n')
 # ensemble-DMFT iteration reuses them and only explores new territory.
 dm_proposals.prior_solutions = ensemble.solutions
 
-ensemble.beta_eff = 1
+ensemble.beta_eff = 40
 
 
 ens_dmft_result = dmft_loop_ensemble_hf(
@@ -398,9 +444,10 @@ ens_dmft_result = dmft_loop_ensemble_hf(
     n_elec_total    = n_target,
     max_iter        = 20,
     eps             = 1e-3,
-    mix             = 0.2,
+    mix             = 0.7,
     adjust_mu       = True,
-    mu_bracket      = 25.0,
+    mu_bracket      = 55.0,
+    crystal_field   = crystal_field,
     with_fock       = True,
     hf_method       = 'hybr',
     hf_tol          = 1e-8,
@@ -596,6 +643,17 @@ plt.tight_layout()
 
 
 
+
+
+
+# %%
+# save the the final converged ensemble landscape
+
+landscape_fig = ensemble.plot_landscape(
+    show      = False,
+)
+
+landscape_fig.suptitle(f'Ensemble DMFT saddle-point landscape\n  U={U} eV, J = {J} eV, cf = {cf_mag} eV, beta = {beta} eV-1', fontsize=18)
 
 
 

@@ -188,7 +188,7 @@ def make_h_int_kanamori_simple(U, Up, J, Jp, norb):
 def dmft_loop_bethe_hf(solver, t, h_int, mu_init, n_target,
                        max_iter=200, mix=0.5, eps=1e-6,
                        verbose=True, adjust_mu=True, mu_bracket=5.0,
-                       spin_kick=None,
+                       spin_kick=None, crystal_field=None,
                        **solver_kwargs):
     """Run a DMFT self-consistency loop on the Bethe lattice using the
     Hartree-Fock impurity solver (``triqs_hartree_fock.ImpuritySolver``).
@@ -246,6 +246,21 @@ def dmft_loop_bethe_hf(solver, t, h_int, mu_init, n_target,
                   'up':   np.diag([1.0, 0.5]),
                   'down': np.diag([-1.0, -0.5]),
               }
+    crystal_field : None or dict
+        Diagonal on-site crystal-field energies, expressed as a dict mapping
+        block names to 1-D arrays of length *norb*::
+
+            crystal_field = {
+                'up':   np.array([ec, ec, ec, 0.0, 0.0]),
+                'down': np.array([ec, ec, ec, 0.0, 0.0]),
+            }
+
+        Each array ``e[a]`` shifts orbital *a* by that amount in the
+        non-interacting Weiss field:
+
+            G0⁻¹(iω) = (iω + μ)·I − diag(e) − t²·G_loc(iω)
+
+        If ``None`` (default) no crystal field is applied.
     **solver_kwargs
         Extra keyword arguments forwarded to ``solver.solve()``.  Useful
         parameters include ``with_fock``, ``one_shot``, ``method``, ``tol``.
@@ -274,6 +289,13 @@ def dmft_loop_bethe_hf(solver, t, h_int, mu_init, n_target,
     t2 = t_arr ** 2
     t2_mat = np.diag(t2)  # (norb, norb)
 
+    # ── Crystal-field diagonal matrices (one per block) ─────────────────────
+    if crystal_field is not None:
+        cf_mat = {bl: np.diag(np.asarray(crystal_field[bl], dtype=float))
+                  for bl in block_names}
+    else:
+        cf_mat = {bl: np.zeros((norb, norb)) for bl in block_names}
+
     # ── Optional spin kick to seed symmetry breaking ────────────────────────
     # spin_kick can be:
     #   None  — no kick (paramagnetic start)
@@ -296,34 +318,28 @@ def dmft_loop_bethe_hf(solver, t, h_int, mu_init, n_target,
         for bl in block_names:
             mpi.report(f'  Sigma_HF[{bl!r}] =\n{solver.Sigma_HF[bl]}')
 
-    # ── Seed solver.G_iw with the non-interacting semicircular GF ─────────────
-    # SemiCircular lazy expression works on DLR meshes via the << operator.
+    # ── Seed G0_iw / G_iw with the non-interacting semicircular GF ─────────────
+    # Start from the Bethe DOS Green's function, then fold in the crystal field:
+    #   G0⁻¹_cf(iω) = G0_sc⁻¹(iω) − diag(ε_cf)
+    # i.e. invert the semicircular, subtract the CF, invert again.
+    # When crystal_field is None, cf_mat is zero and this reduces to the plain
+    # semicircular initialisation.
     for bl in block_names:
-        # for a in range(norb):
-            # this is wrong
-            # solver.G_iw[bl][a, a] << SemiCircular(2.0 * t_arr[a])
-
-            # solver.G0_iw[bl][a, a] << SemiCircular(2.0 * t_arr[a])
-
         solver.G0_iw[bl] << SemiCircular(2.0 * t_arr[0])
-        solver.G_iw[bl] << inverse(inverse(solver.G0_iw[bl])-solver.Sigma_HF[bl])
-
-            # solver.G0_iw[bl][a, a] << SemiCircular(2.0 * t_arr[a])
-            # solver.
+        solver.G0_iw[bl] << inverse(inverse(solver.G0_iw[bl]) - cf_mat[bl])
+        solver.G_iw[bl]  << inverse(inverse(solver.G0_iw[bl]) - solver.Sigma_HF[bl])
 
 
     # Helper: set G0_iw from the current solver.G_iw using the Bethe relation.
     # Operates directly on .data arrays to avoid __call__ on the DLR mesh.
     def _set_G0_bethe(mu_val):
-        """G0⁻¹[i] = (iω_i + μ)·I − t²·G_iw[i]  for each DLR point i."""
+        """G0⁻¹[i] = (iω_i + μ)·I − diag(ε_cf) − t²·G_iw[i]  for each DLR point i."""
         for bl in block_names:
-            # solver.G0_iw[bl] << SemiCircular(2.0 * t_arr[a])
-
             mesh_pts = list(solver.G0_iw[bl].mesh)
             for i, iw in enumerate(mesh_pts):
                 iw_val = complex(iw)
                 G_loc_val = solver.G_iw[bl].data[i]
-                G0_inv = (iw_val + mu_val) * np.eye(norb) - t2_mat @ G_loc_val
+                G0_inv = (iw_val + mu_val) * np.eye(norb) - cf_mat[bl] - t2_mat @ G_loc_val
                 solver.G0_iw[bl].data[i] = np.linalg.inv(G0_inv)
 
     def _total_density_trial(mu_val):
@@ -335,7 +351,7 @@ def dmft_loop_bethe_hf(solver, t, h_int, mu_init, n_target,
             for i, iw in enumerate(mesh_pts):
                 iw_val = complex(iw)
                 G_loc_val = solver.G_iw[bl].data[i]
-                G0_inv = (iw_val + mu_val) * np.eye(norb) - t2_mat @ G_loc_val
+                G0_inv = (iw_val + mu_val) * np.eye(norb) - cf_mat[bl] - t2_mat @ G_loc_val
                 G_inv = G0_inv - solver.Sigma_HF[bl]
                 G_tmp.data[i] = np.linalg.inv(G_inv)
             n_total += G_tmp.density().real.trace()
@@ -465,6 +481,7 @@ def dmft_loop_ensemble_hf(
     hf_tol: float = 1e-8,
     seed: int = 42,
     verbose: bool = True,
+    crystal_field: dict = None,
 ):
     """Run a Bethe-lattice DMFT self-consistency loop using the
     :class:`IncoherentEnsembleSolver` as the impurity solver.
@@ -525,6 +542,20 @@ def dmft_loop_ensemble_hf(
         Base random seed; iteration ``it`` uses ``seed + it * 1000``.
     verbose         : bool
         Print per-iteration diagnostics.
+    crystal_field   : None or dict
+        Diagonal on-site crystal-field energies, expressed as a dict mapping
+        block names to 1-D arrays of length *norb*::
+
+            crystal_field = {
+                'up':   np.array([ec, ec, ec, 0.0, 0.0]),
+                'down': np.array([ec, ec, ec, 0.0, 0.0]),
+            }
+
+        Each array ``e[a]`` shifts orbital *a* in the Weiss field:
+
+            G0⁻¹(iω) = (iω + μ)·I − diag(e) − t²·G_ens(iω)
+
+        If ``None`` (default) no crystal field is applied.
 
     Returns
     -------
@@ -544,22 +575,29 @@ def dmft_loop_ensemble_hf(
     t_arr  = np.broadcast_to(np.atleast_1d(np.asarray(t, dtype=float)), (norb,)).copy()
     t2_mat = np.diag(t_arr ** 2)
 
+    # ── Crystal-field diagonal matrices (one per block) ─────────────────────
+    if crystal_field is not None:
+        cf_mat = {bl: np.diag(np.asarray(crystal_field[bl], dtype=float))
+                  for bl in block_names}
+    else:
+        cf_mat = {bl: np.zeros((norb, norb)) for bl in block_names}
+
     mu     = float(mu_init)
     G0_cur = G0_iw.copy()
 
     def _update_G0(G_ens, mu_val):
-        """Overwrite G0_cur in-place: G0⁻¹[i] = (iω_i+μ)·I − t²·G_ens[i]."""
+        """Overwrite G0_cur in-place: G0⁻¹[i] = (iω_i+μ)·I − diag(ε_cf) − t²·G_ens[i]."""
         for bl in block_names:
             for i, iw in enumerate(G0_cur[bl].mesh):
                 iw_v   = complex(iw)
-                G0_inv = (iw_v + mu_val) * np.eye(norb) - t2_mat @ G_ens[bl].data[i]
+                G0_inv = (iw_v + mu_val) * np.eye(norb) - cf_mat[bl] - t2_mat @ G_ens[bl].data[i]
                 G0_cur[bl].data[i] = np.linalg.inv(G0_inv)
 
     def _density_with_sigma(mu_val, Sigma_iw):
         """Total local density at trial μ using the current ensemble Σ(iω).
 
         G_trial⁻¹(iω) = G0⁻¹(iω; μ_trial) − Σ_ens(iω)
-                       = [(iω+μ)·I − t²·G_ens] − Σ_ens
+                       = [(iω+μ)·I − diag(ε_cf) − t²·G_ens] − Σ_ens
 
         This is the physically correct density for a correlated system:
         the bath G0 alone gives the wrong answer in a Mott state.
@@ -569,7 +607,7 @@ def dmft_loop_ensemble_hf(
             G_trial = G0_cur[bl].copy()
             for i, iw in enumerate(G_trial.mesh):
                 iw_v   = complex(iw)
-                G0_inv = (iw_v + mu_val) * np.eye(norb) - t2_mat @ G_ens_cur[bl].data[i]
+                G0_inv = (iw_v + mu_val) * np.eye(norb) - cf_mat[bl] - t2_mat @ G_ens_cur[bl].data[i]
                 G_trial.data[i] = np.linalg.inv(G0_inv - Sigma_iw[bl].data[i])
             n_tot += float(G_trial.total_density().real)
         return n_tot
