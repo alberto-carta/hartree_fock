@@ -16,6 +16,7 @@ Workflow
 3. Plot the saddle-point landscape and the ensemble spectral functions.
 """
 
+
 #%%
 import os
 import sys
@@ -42,6 +43,7 @@ from triqs_hartree_fock import (
 )
 from dmft_driver import dmft_loop_bethe_hf, dmft_loop_ensemble_hf, make_h_int_kanamori_simple
 
+colorcycle = plt.rcParams['axes.prop_cycle'].by_key()['color']
 plt.rcParams.update({'font.size': 12})
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -50,13 +52,20 @@ plt.rcParams.update({'font.size': 12})
 t        = 1.0      # Bethe-lattice hopping; half-bandwidth W = 2t
 beta     = 40.0     # inverse temperature
 w_max    = 20.0     # DLR energy cutoff
-eps_dlr  = 1e-9     # DLR accuracy
+eps_dlr  = 1e-13     # DLR accuracy
 
-norb     = 3        # number of orbitals
+norb     = 2        # number of orbitals
 n_target = 2     # half-filling: norb electrons total
 
-U = 8.0
-J = 1.0
+# U = 5.0
+# J = 0.3
+
+
+# norb     = 5        # number of orbitals
+# n_target = 5     # half-filling: norb electrons total
+
+U = 3.0
+J = 0.3
 
 
 gf_struct = [('up', norb), ('down', norb)]
@@ -68,8 +77,18 @@ mpi.report('\n' + '=' * 70)
 mpi.report(f'  Step 1: PM HF-DMFT   |   norb={norb}   U={U}   J={J}   β={beta}')
 mpi.report('=' * 70 + '\n')
 
+# h_int = make_h_int_kanamori_simple(U, U, J, J, norb=norb)
 h_int = make_h_int_kanamori_simple(U, U - 2*J, J, 0, norb=norb)
 # h_int = make_h_int_kanamori_simple(U, U - 2*J, J, J, norb=norb) # this can generate a goldstone mode without crystal field
+
+# from triqs.operators.operators import n, c_dag, c
+# if norb is 5 add a crystal field to the hamiltonian to break the degeneracy and avoid the goldstone mode
+# if norb == 5:
+#     delta = 0.2 # 200 meV crystal field is somewhat realistic
+#     for spin in ['up', 'down']:
+#         for orb in range(norb):
+#             if orb < 3:
+#                 h_int += delta * c_dag(spin, orb) * c(spin, orb)
 
 pm_solver = ImpuritySolver(
     gf_struct = gf_struct,
@@ -78,6 +97,7 @@ pm_solver = ImpuritySolver(
     eps       = eps_dlr,
     dc        = 'cFLL',
 )
+# mu_init = U
 
 pm_result = dmft_loop_bethe_hf(
     solver    = pm_solver,
@@ -90,7 +110,7 @@ pm_result = dmft_loop_bethe_hf(
     eps       = 1e-12,
     verbose   = True,
     adjust_mu = True,
-    mu_bracket = 75.0,
+    mu_bracket = 25.0,
     with_fock = True,
     one_shot  = True,
     method    = 'hybr',
@@ -112,6 +132,7 @@ mpi.report(f'  n_down = {np.round(n_down, 4)}')
 mpi.report(f'  m      = {np.round(n_up - n_down, 4)}')
 mpi.report('-' * 70 + '\n')
 
+
 #%%
 # ══════════════════════════════════════════════════════════════════════════════
 #  Step 2 – Ensemble impurity solve on the converged bath
@@ -125,18 +146,34 @@ mpi.report('=' * 70 + '\n')
 # searches; keep the class available but default to DM proposals only.
 #
 # sobol_proposals = SobolSigmaProposals(
-#     n_samples        = 300,
-#     sigma_bound      = U / 2,
+#     n_samples        = 50,
+#     sigma_bound      = U,
 #     sigma_offset     = mu,
 #     offdiag_fraction = 0.2,
 # )
 
 dm_proposals = DensityMatrixProposals(
-    n_proposals       = 200,
+    n_proposals       = 50,
     n_targeting_steps = 30,
-    targeting_alpha   = 0.5,
-    half_occ_prob     = 0.10,
+    # targeting_alpha   = 0.5,
+    targeting_alpha   = 2.0,
+    half_occ_prob     = 0.2,
     force_real        = True,
+    # Explicit Hund's m=2 targets — all three orbital permutations of [1,1,0]/[0,0,0].
+    # These guarantee the magnetic fixed points are proposed regardless of random sampling.
+    # They count toward n_proposals and are processed through the targeting loop.
+    custom_proposals  = [
+        {'up': np.diag([1]*norb), 'down': np.diag([0]*norb)},
+        {'up': np.diag([1]*norb), 'down': np.diag([0]*norb)},
+        # {'up': np.diag([0., 0.]), 'down': np.diag([1., 0.])},
+        # {'up': np.diag([0., 0.]), 'down': np.diag([0., 1.])},
+        # {'up': np.diag([1., 1.]), 'down': np.diag([0., 1.])},
+    ],
+    # custom_proposals  = [
+    #     {'up': np.diag([1., 1., 0.]), 'down': np.diag([0., 0., 0.])},
+    #     {'up': np.diag([1., 0., 1.]), 'down': np.diag([0., 0., 0.])},
+    #     {'up': np.diag([0., 1., 1.]), 'down': np.diag([0., 0., 0.])},
+    # ],
     # prior_solutions is None on first call; updated automatically in
     # dmft_loop_ensemble_hf for subsequent iterations.
 )
@@ -151,11 +188,20 @@ ensemble = IncoherentEnsembleSolver(
     force_real     = True,
 )
 
+from triqs.gf import SemiCircular
+
 ensemble.G0_iw['up'].data[:]   = G0_conv['up'].data
 ensemble.G0_iw['down'].data[:] = G0_conv['down'].data
+# ensemble.G0_iw['down'] << SemiCircular(2.0 * t)
+# ensemble.G0_iw['down'] << inverse(inverse(ensemble.G0_iw['down']) - mu)
+
+# ensemble.G0_iw['up'] << SemiCircular(2.0 * t)
+# ensemble.G0_iw['up'] << inverse(inverse(ensemble.G0_iw['up']) - mu)
+
 ensemble.solve(
     h_int              = h_int,
     proposal_generators = [dm_proposals],
+    # proposal_generators = [sobol_proposals],
     mu                 = mu,
     n_elec_total       = n_target,
     with_fock          = True,
@@ -177,19 +223,35 @@ mpi.report(f'  β·ΔF (max)          : '
 mpi.report('\n' + repr(ensemble.solutions))
 mpi.report('\n' + '=' * 70 + '\n')
 
+
+
+
+plot_dir = f'Plots_norb{norb}_U{U}_J{J}_beta{int(beta)}_ntarget{n_target}'
+
+if not os.path.exists(plot_dir):
+    os.makedirs(plot_dir)
+
+
+
+
 #%%
-# ══════════════════════════════════════════════════════════════════════════════
-#  Plots
-# ══════════════════════════════════════════════════════════════════════════════
-
-colorcycle = plt.rcParams['axes.prop_cycle'].by_key()['color']
-
-# ── 1. Saddle-point landscape ─────────────────────────────────────────────────
 landscape_fig = ensemble.plot_landscape(
     show      = False,
-    save_path = f'ensemble_landscape_norb{norb}_U{U}_J{J}.jpg',
 )
+
+landscape_fig.suptitle(f'U={U} eV, J = {J} eV, beta = {beta} eV-1', fontsize=18)
+
+axes = landscape_fig.axes
+
+# get axes from figure
+axes[0].set_title("Discovered stationary states", fontsize=16)
+
+plt.savefig(f"{plot_dir}/saddle_point_landscape.jpg", dpi=300, bbox_inches='tight')
+
 plt.show()
+
+
+
 
 #%%
 from triqs.gf import *
@@ -204,6 +266,7 @@ def make_gf_tau(G_iw, norb=norb, beta=beta):
     G_tau.set_from_fourier(G_imfreq)
 
     return G_tau
+
 
 Gtau_ens_up   = make_gf_tau(ensemble.G_iw['up'])
 Gtau_ens_down = make_gf_tau(ensemble.G_iw['down'])
@@ -320,9 +383,13 @@ mpi.report('=' * 70 + '\n')
 # ensemble-DMFT iteration reuses them and only explores new territory.
 dm_proposals.prior_solutions = ensemble.solutions
 
+ensemble.beta_eff = 1
+
+
 ens_dmft_result = dmft_loop_ensemble_hf(
     ensemble_solver = ensemble,
     dm_proposals    = dm_proposals,
+    # dm_proposals    = sobol_proposals,
     h_int           = h_int,
     G0_iw           = G0_conv,        # start from PM bath
     t               = t,
@@ -331,7 +398,7 @@ ens_dmft_result = dmft_loop_ensemble_hf(
     n_elec_total    = n_target,
     max_iter        = 20,
     eps             = 1e-3,
-    mix             = 0.5,
+    mix             = 0.2,
     adjust_mu       = True,
     mu_bracket      = 25.0,
     with_fock       = True,
@@ -349,6 +416,12 @@ mpi.report(f'  Unique saddle points    : {ensemble.n_converged}')
 mpi.report('\n' + repr(ensemble.solutions))
 mpi.report('\n' + '=' * 70 + '\n')
 
+# make a directory to save the plots if it doesn't exist
+# encode norb, U, J, and beta, target n
+
+
+
+
 #%%
 # ── Plot ensemble DMFT G(τ)
 
@@ -365,7 +438,21 @@ Gtau_ens_down = make_gf_tau(final_ens_G['down'])
 
 oplot(Gtau_ens_up[0,0].real, color=colorcycle[0], lw=2, label='ens DMFT up 0 0')
 oplot(Gtau_ens_up[1,1].real, color=colorcycle[1], lw=2, label='ens DMFT up 1 1')
-oplot(Gtau_ens_up[2,2].real, color=colorcycle[2], lw=2, label='ens DMFT up 1 1')
+# oplot(Gtau_ens_up[2,2].real, color=colorcycle[2], lw=2, label='ens DMFT up 1 1')
+
+
+# print G_tau(beta/2) for a quick estimate of the density
+with np.printoptions(precision=4, suppress=True):
+    print('Ensemble DMFT G(β/2):')
+
+    betahalf = int(len(Gtau_ens_up.mesh) // 2)
+    print(f'  G_up(β/2): \n {Gtau_ens_up.data[betahalf].real}')
+    print(f'  G_down(β/2): \n {Gtau_ens_down.data[betahalf].real}')
+    # print(f'  G_down(β/2): \n {Gtau_ens_down.data[:, int(len(Gtau_ens_down.mesh) // 2)].real}')
+
+
+plt.savefig(f'{plot_dir}/ensemble_DMFT_Gtau.jpg', dpi=200, bbox_inches='tight')
+
 
 
 # plt.ylim(-0.002, 0)
@@ -382,9 +469,52 @@ with np.printoptions(precision=4, suppress=True):
     print(f'  n_up: \n {mup}')
     print(f'  n_down: \n {mdn}')
 # %%
+#%%
+
+# make a nicer plot with both real and imaginary parts with 2 subplots
+fig, axes = plt.subplots(1, 2, figsize=(12, 5), sharex=True)
+
+# get ax 0
+mesh = final_ens_Sigma['up'].mesh
+freqs_array = np.array([ complex(iw) for iw in mesh.values()])
+plt.sca(axes[0])
+for iorb in range(1):
+    # oplot(final_ens_Sigma_up_iw[iorb, iorb].real, color=colorcycle[iorb], linestyle="-",lw=2, label='ens up 0 0', x_window=(0, 20))
+    plt.plot(freqs_array.imag,
+            final_ens_Sigma['up'][iorb,iorb].data.real,
+              color=colorcycle[iorb],
+            linestyle="-",lw=2,
+            marker='o', markersize=4, 
+            label='ens up 0 0')
+    # plt
+plt.sca(axes[1])
+for iorb in range(1):
+    plt.plot(freqs_array.imag, final_ens_Sigma['up'][iorb,iorb].data.imag,
+             color=colorcycle[iorb],
+             linestyle="-", lw=2,
+             marker='o', markersize=4,
+             label='ens up 0 0')
+
+axes[0].set_title('Real part of Σ(iω)', fontsize=14)
+axes[1].set_title('Imaginary part of Σ(iω)', fontsize=14)
+axes[0].set_xlabel(r'Matsubara $i\omega_n$', fontsize=13)
+axes[1].set_xlabel(r'Matsubara $i\omega_n$', fontsize  =13)
+axes[0].set_ylabel(r'$\mathrm{Re}\,\Sigma(i\omega_n)$', fontsize=13)
+axes[1].set_ylabel(r'$\mathrm{Im}\,\Sigma(i\omega_n)$', fontsize=13)
+
+axes[0].set_xlim([0, 20])
+axes[0].set_ylim([20, 22])
+axes[1].set_xlim([0, 20])
+axes[1].set_ylim([-20, 0.1])
 
 
-oplot(final_ens_Sigma['up'].real, color=colorcycle[0], lw=2, label='ens up 0 0', x_window=(0, 20))
+
+
+
+
+plt.ylim(bottom=-30)
+plt.savefig(f'{plot_dir}/ensemble_Sigma_iw.jpg', dpi=300, bbox_inches='tight')
+
 
 
 
@@ -398,11 +528,39 @@ Gw_ens_down   = _pade_block(G_iw_freq_down)
 
 
 
-oplot(-1/np.pi*Gw_ens_up[0,0].imag, color=colorcycle[0], lw=2, label='ens DMFT up 0 0')
-oplot(-1/np.pi*Gw_ens_up[1,1].imag, color=colorcycle[1], lw=2, label='ens DMFT up 1 1')
-oplot(-1/np.pi*Gw_ens_up[2,2].imag, color=colorcycle[2], lw=2, label='ens DMFT up 1 1')
-# oplot(-1/np.pi*Gw_ens_down[0,0].imag, color=colorcycle[0], lw=2, label='ens DMFT down 0 0')
-# oplot(-1/np.pi*Gw_ens_down[1,1].imag, color=colorcycle[1], lw=2, label='ens DMFT down 1 1')
+# oplot(-1/np.pi*Gw_ens_up[0,0].imag, color=colorcycle[0], lw=2, label='ens DMFT up 0 0')
+# oplot(-1/np.pi*Gw_ens_up[1,1].imag, color=colorcycle[1], lw=2, label='ens DMFT up 1 1')
+# # oplot(-1/np.pi*Gw_ens_up[2,2].imag, color=colorcycle[2], lw=2, label='ens DMFT up 1 1')
+# oplot(+1/np.pi*Gw_ens_down[0,0].imag, color=colorcycle[0], lw=2, label='ens DMFT down 0 0')
+# oplot(+1/np.pi*Gw_ens_down[1,1].imag, color=colorcycle[1], lw=2, label='ens DMFT down 1 1')
+
+
+w_wals = np.array(list(Gw_ens_up.mesh.values())).real
+
+
+for iorb in range(norb):
+    plt.plot(w_vals, -1/np.pi*Gw_ens_up[iorb, iorb].data.imag,
+             color=colorcycle[iorb], lw=2, label=f'Up spin, orb {iorb}')
+    plt.plot(w_vals, +1/np.pi*Gw_ens_down[iorb, iorb].data.imag,
+             color=colorcycle[iorb], lw=2, label=f'Down spin, orb {iorb}', linestyle='--')
+
+plt.title(
+    f'Ensemble  spectral function\n  A(ω) = −Im G(ω)/π   |   U={U}   J={J}   β={beta}',
+    fontsize=14, y=1.02
+)
+plt.xlabel(r'$\omega$', fontsize=13)
+plt.ylabel(r'pDOS [ev$^{-1}$]', fontsize=13)
+plt.legend(fontsize=10, ncol=1, bbox_to_anchor=(1.1, 1.05))
+
+plt.ylim(top=0.5)
+
+
+plt.savefig(f'{plot_dir}/ensemble_pdos.jpg', dpi=300, bbox_inches='tight')
+
+
+
+
+
 
 with np.printoptions(precision=4, suppress=True):
     mup_w = Gw_ens_up.density()
@@ -412,5 +570,33 @@ with np.printoptions(precision=4, suppress=True):
     print(f'  n_down: \n {mdn_w}')
 
 # %% debug here`
+# sum up and down, trace over orbitals, and plot the total spectral function
+Gw_ens_total = Gw_ens_up + Gw_ens_down
+A_ens =  Gw_ens_total[0,0].copy()
+
+for iorb in range(norb):
+    A_ens = -1/np.pi * Gw_ens_total[iorb, iorb].imag
 
 
+oplot(A_ens, color='purple', lw=2, label='Total A(ω)')
+plt.title(
+    f'Ensemble spectral function \n A(ω) = −Im G(ω)/π   |   U={U}   J={J}   β={beta}',   
+    fontsize=14, y=1.02
+)
+plt.xlabel(r'$\omega$', fontsize=13)
+plt.ylabel(r'$-\mathrm{Im}\,G(\omega)/\pi$', fontsize=13)
+# plt.xlim(0, 20)
+plt.grid(True, alpha=0.3)
+plt.legend(fontsize=10)
+
+plt.savefig(f'{plot_dir}/ensemble_Aw_tot.jpg', dpi=300, bbox_inches='tight')
+
+plt.tight_layout()
+
+
+
+
+
+
+
+# %%

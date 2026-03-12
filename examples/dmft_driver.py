@@ -17,7 +17,7 @@ The driver handles:
 
 import numpy as np
 import triqs.utility.mpi as mpi
-from triqs.gf import Gf, BlockGf, MeshImFreq, SemiCircular
+from triqs.gf import Gf, BlockGf, MeshImFreq, SemiCircular, inverse
 from triqs.lattice.tight_binding import TBLattice
 from triqs.operators import n, c, c_dag, Operator
 from triqs.operators.util.hamiltonians import h_int_kanamori
@@ -151,7 +151,7 @@ def make_h_int_kanamori_simple(U, Up, J, Jp, norb):
     h_int = U Σ_a n_{a↑}n_{a↓}
           + Σ_{a<b} [ Up n_{a↑}n_{b↓} + Up n_{a↓}n_{b↑}
                      + (Up-J) n_{a↑}n_{b↑} + (Up-J) n_{a↓}n_{b↓} ]
-          - J Σ_{a≠b} c†_{a↑} c†_{a↓} c_{b↓} c_{b↑}   (spin-flip)
+          - Jp Σ_{a≠b} c†_{a↑} c†_{a↓} c_{b↓} c_{b↑}   (spin-flip)
           + Jp Σ_{a≠b} c†_{a↑} c†_{b↓} c_{a↓} c_{b↑}  (pair-hopping)
     """
     h = Operator()
@@ -173,7 +173,7 @@ def make_h_int_kanamori_simple(U, Up, J, Jp, norb):
                         h += 0.5 * Up * n(s, a) * n(sp, b)
 
             # Spin-flip: -J c†_{a↑} c_{a↓} c†_{b↓} c_{b↑}
-            h += -J * c_dag('up', a) * c('down', a) * c_dag('down', b) * c('up', b)
+            h += -Jp * c_dag('up', a) * c('down', a) * c_dag('down', b) * c('up', b)
 
             # Pair-hopping: Jp c†_{a↑} c†_{a↓} c_{b↓} c_{b↑}
             h += Jp * c_dag('up', a) * c_dag('down', a) * c('down', b) * c('up', b)
@@ -299,14 +299,26 @@ def dmft_loop_bethe_hf(solver, t, h_int, mu_init, n_target,
     # ── Seed solver.G_iw with the non-interacting semicircular GF ─────────────
     # SemiCircular lazy expression works on DLR meshes via the << operator.
     for bl in block_names:
-        for a in range(norb):
-            solver.G_iw[bl][a, a] << SemiCircular(2.0 * t_arr[a])
+        # for a in range(norb):
+            # this is wrong
+            # solver.G_iw[bl][a, a] << SemiCircular(2.0 * t_arr[a])
+
+            # solver.G0_iw[bl][a, a] << SemiCircular(2.0 * t_arr[a])
+
+        solver.G0_iw[bl] << SemiCircular(2.0 * t_arr[0])
+        solver.G_iw[bl] << inverse(inverse(solver.G0_iw[bl])-solver.Sigma_HF[bl])
+
+            # solver.G0_iw[bl][a, a] << SemiCircular(2.0 * t_arr[a])
+            # solver.
+
 
     # Helper: set G0_iw from the current solver.G_iw using the Bethe relation.
     # Operates directly on .data arrays to avoid __call__ on the DLR mesh.
     def _set_G0_bethe(mu_val):
         """G0⁻¹[i] = (iω_i + μ)·I − t²·G_iw[i]  for each DLR point i."""
         for bl in block_names:
+            # solver.G0_iw[bl] << SemiCircular(2.0 * t_arr[a])
+
             mesh_pts = list(solver.G0_iw[bl].mesh)
             for i, iw in enumerate(mesh_pts):
                 iw_val = complex(iw)

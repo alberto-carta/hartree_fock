@@ -377,7 +377,8 @@ class DensityMatrixProposals(ProposalGenerator):
 
     Parameters
     ----------
-    n_proposals       : number of random targets (total, including recycled ones)
+    n_proposals       : number of random targets (total, including recycled ones
+                        and custom targets).
     n_targeting_steps : gradient-ascent iterations before release
     targeting_alpha   : step size α
     half_occ_prob     : per-orbital probability of occupation 0.5
@@ -390,6 +391,17 @@ class DensityMatrixProposals(ProposalGenerator):
                         remaining slots are filled with new random targets.
                         Update ``dm_proposals.prior_solutions`` between DMFT
                         iterations to warm-start successive ensemble solves.
+    custom_proposals  : optional list of explicit density-matrix targets.
+                        Each entry is a dict mapping block name → (norb × norb)
+                        real ndarray (a target density matrix, *not* a Σ_HF).
+                        These are processed through the targeting loop first,
+                        before any recycled or random proposals.  They count
+                        toward ``n_proposals``.
+                        Example::
+
+                            custom_proposals = [
+                                {'up': np.diag([1,1,0]), 'down': np.diag([0,0,0])},
+                            ]
     """
 
     def __init__(
@@ -400,6 +412,7 @@ class DensityMatrixProposals(ProposalGenerator):
         half_occ_prob: float = 0.10,
         force_real: bool = True,
         prior_solutions=None,
+        custom_proposals=None,
     ):
         self.n_proposals       = n_proposals
         self.n_targeting_steps = n_targeting_steps
@@ -407,6 +420,7 @@ class DensityMatrixProposals(ProposalGenerator):
         self.half_occ_prob     = half_occ_prob
         self.force_real        = force_real
         self.prior_solutions   = prior_solutions   # SolutionSet | list[Solution] | None
+        self.custom_proposals  = custom_proposals  # list[{bl: rho_target}] | None
 
     # ------------------------------------------------------------------
     def generate(self, G0_iw, n_elec_total, norb, gf_struct, seed=0):
@@ -415,10 +429,22 @@ class DensityMatrixProposals(ProposalGenerator):
 
         proposals = []
 
-        # ── 0. Recycle Σ_HF from prior solutions ─────────────────────────
+        # ── 0a. Custom density-matrix targets (run through targeting loop) ──
+        if self.custom_proposals is not None:
+            for rho_target in self.custom_proposals:
+                if len(proposals) >= self.n_proposals:
+                    break
+                dtype = float if self.force_real else complex
+                sigma = {bl: np.zeros((norb, norb), dtype=dtype) for bl in blocks}
+                for _ in range(self.n_targeting_steps):
+                    sigma, _ = _targeting_step(G0_iw, sigma, rho_target,
+                                               self.targeting_alpha, self.force_real)
+                proposals.append(sigma)
+
+        # ── 0b. Recycle Σ_HF from prior solutions ────────────────────────
         if self.prior_solutions is not None:
             prior_list = list(self.prior_solutions)   # works for SolutionSet or list
-            n_recycle  = min(len(prior_list), self.n_proposals)
+            n_recycle  = min(len(prior_list), max(0, self.n_proposals - len(proposals)))
             for sol in prior_list[:n_recycle]:
                 sigma_recycled = {
                     bl: (np.array(sol.Sigma_HF[bl]).real.astype(float)
@@ -427,10 +453,7 @@ class DensityMatrixProposals(ProposalGenerator):
                     for bl in blocks
                 }
                 proposals.append(sigma_recycled)
-        else:
-            n_recycle = 0
-
-        n_new = self.n_proposals - n_recycle
+        n_new = max(0, self.n_proposals - len(proposals))
 
         # ── 1+2. Random DM targets + targeting loop ───────────────────────
         n_up_min = max(0, int(round(n_elec_total)) - norb)
@@ -460,10 +483,12 @@ class DensityMatrixProposals(ProposalGenerator):
         return proposals
 
     def __repr__(self):
-        n_prior = len(self.prior_solutions) if self.prior_solutions is not None else 0
+        n_prior  = len(self.prior_solutions)  if self.prior_solutions  is not None else 0
+        n_custom = len(self.custom_proposals) if self.custom_proposals is not None else 0
         return (f"DensityMatrixProposals(n_proposals={self.n_proposals}, "
                 f"n_steps={self.n_targeting_steps}, alpha={self.targeting_alpha}, "
-                f"half_occ_prob={self.half_occ_prob}, n_prior={n_prior})")
+                f"half_occ_prob={self.half_occ_prob}, n_prior={n_prior}, "
+                f"n_custom={n_custom})")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -529,6 +554,7 @@ class IncoherentEnsembleSolver:
     ):
         self.gf_struct            = gf_struct
         self.beta                 = beta
+        self.beta_eff             = beta # to weigh free energy differences for Boltzmann factors (can be scaled down to flatten weights)
         self.w_max                = w_max
         self.eps                  = eps
         self.dc_fixed_value       = dc_fixed_value
@@ -584,7 +610,7 @@ class IncoherentEnsembleSolver:
 
         self._report('\n' + '═' * 70)
         self._report('  IncoherentEnsembleSolver.solve()')
-        self._report(f'  β = {self.beta:.1f}   norb = {self.norb}   '
+        self._report(f'  β = {self.beta:.1f},   β_eff = {self.beta_eff:.1f},   norb = {self.norb}   '
                      f'n_target = {n_elec_total:.2f}   force_real = {self.force_real}')
         for i, gen in enumerate(proposal_generators):
             self._report(f'  Generator {i}: {gen!r}')
@@ -695,9 +721,11 @@ class IncoherentEnsembleSolver:
         self.n_converged = len(records)
 
         # ── Boltzmann weights ──────────────────────────────────────────────
+
+
         F_arr    = np.array([r['free_energy'] for r in records])
         dF       = F_arr - F_arr.min()
-        w_unnorm = np.exp(-self.beta * dF)
+        w_unnorm = np.exp(-self.beta_eff * dF)
         weights  = w_unnorm / w_unnorm.sum()
 
         self._report('\n  Free-energy range:  '
@@ -863,6 +891,7 @@ class IncoherentEnsembleSolver:
         fontsize_label: float = 13,
         fontsize_title: float = 14,
         fontsize_legend: float = 11,
+        
     ):
         """Plot the discovered HF state landscape.
 
@@ -897,6 +926,7 @@ class IncoherentEnsembleSolver:
         fig.suptitle(
             f'HF saddle-point landscape   |   '
             f'β={self.beta:.0f}   norb={self.norb}   '
+            f'β_eff={self.beta_eff:.0f}   norb={self.norb}   '
             f'{n_conv}/{n_total} converged',
             fontsize=fontsize_title + 1, y=1.02
         )

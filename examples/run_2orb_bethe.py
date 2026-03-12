@@ -2,6 +2,7 @@
 import os
 import sys
 
+
 # ── Path setup ──────────────────────────────────────────────────────────────
 _here = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_here, '..', 'python'))  # make triqs_hartree_fock importable (dev)
@@ -35,11 +36,6 @@ gf_struct = [('up', norb), ('down', norb)]
 #                'down': np.diag([-1.0, -0.5])}
 #
 # Here we use a uniform ferromagnetic kick (same shift on both orbitals):
-mu_guess = 7.0
-spin_kick = {
-    'up':   np.diag([mu_guess-10.0,mu_guess-10.0]),   # both orbitals spin-up shifted by +1
-    'down': np.diag([mu_guess+10.0,mu_guess+10.0]), # both orbitals spin-down shifted by -1
-}
 
 # spin_kick = {
 #     'up':   4*np.diag([+1.0,+1.0]),   # both orbitals spin-up shifted by +1
@@ -51,7 +47,13 @@ mpi.report('\n' + '='*70)
 mpi.report('  2-orbital Bethe lattice HF-DMFT  |  t={:.2f}  β={:.1f}'.format(t, beta))
 mpi.report('='*70 + '\n')
 
-U_values = [2.5]
+U_values = [5.5]
+
+mu_guess = U_values[0]
+spin_kick = {
+    'up':   np.diag([mu_guess-10.0,mu_guess-10.0]),   # both orbitals spin-up shifted by +1
+    'down': np.diag([mu_guess+10.0,mu_guess+10.0]), # both orbitals spin-down shifted by -1
+}
 
 results = {}
 for U in U_values:
@@ -104,6 +106,7 @@ for U in U_values:
         f'n_iter={res["n_iter"]}'
     )
 
+
 #%%
 # ── Summary table ────────────────────────────────────────────────────────────
 mpi.report('\n' + '='*70)
@@ -122,6 +125,7 @@ for U, res in results.items():
         f'{str(res["converged"]):>6}  {res["n_iter"]:5d}'
     )
 mpi.report('='*70 + '\n')
+
 
 
 # %%
@@ -357,7 +361,7 @@ Sigma_eff = -inverse(G_total) + inverse(solver.G0_iw)
 
 
 oplot(Sigma_eff['up'], '-o', label='Sigma_eff_00')
-plt.xlim(0, 20)
+plt.xlim(-1, 20)
 
 #%%
 
