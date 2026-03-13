@@ -181,6 +181,53 @@ def make_h_int_kanamori_simple(U, Up, J, Jp, norb):
     return h
 
 
+def make_h_int_dft_like(U, J, norb):
+    """DFT-like simplified multi-orbital Hamiltonian.
+
+    Captures the essential physics of an atomic shell with two parameters:
+
+        H = U/2 · N(N-1) - J/4 · M²   (purely two-body)
+
+    where N = total electron count, M = N_up - N_down (magnetisation).
+
+    Derivation
+    ----------
+    Writing Sz = (N_up - N_down)/2, the operator Sz² contains a spurious
+    one-body piece because n_{iσ}² = n_{iσ} for fermions:
+
+        Sz² = Sz²_two-body + (1/4)·N
+
+    This one-body term is a uniform level shift (proportional to N) that
+    is trivially absorbed by the chemical potential in DMFT.  It is
+    dropped here so that the returned operator is purely two-body, which
+    is the standard TRIQS convention for interaction Hamiltonians.
+
+    The two-body structure in the density-density channel is:
+      - Same-spin pairs   (iσ, jσ, i≠j): coefficient  U/2 − J/4
+      - Opposite-spin pairs (i↑, j↓)    : coefficient  U/2 + J/2
+
+    Parameters
+    ----------
+    U : float
+        On-site Hubbard repulsion applied to each electron pair.
+    J : float
+        Hund's exchange parameter; energy gain is J/4 · M².
+    norb : int
+        Number of orbitals in the shell.
+
+    Returns
+    -------
+    triqs.operators.Operator  (purely two-body, no one-body terms)
+    """
+    from triqs.operators.util.observables import N_op, S_op
+    spin_names = ['up', 'down']
+    N  = N_op(spin_names, norb, off_diag=True)
+    Sz = S_op('z', spin_names, norb, off_diag=True)
+    # Subtract (J/4)·N to remove the one-body piece from Sz²
+    # this might lead to problems when more than one impurity
+    return (U / 2) * N * (N - 1) - J * Sz * Sz + (J / 4) * N
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 #  Bethe lattice DMFT loop for the Hartree-Fock impurity solver
 # ──────────────────────────────────────────────────────────────────────────────
