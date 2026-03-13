@@ -55,7 +55,7 @@ w_max    = 20.0     # DLR energy cutoff
 eps_dlr  = 1e-13     # DLR accuracy
 
 norb     = 5        # number of orbitals
-n_target = 5     # half-filling: norb electrons total
+n_target = 9     # half-filling: norb electrons total
 
 # U = 5.0
 # J = 0.3
@@ -78,8 +78,8 @@ mpi.report(f'  Step 1: PM HF-DMFT   |   norb={norb}   U={U}   J={J}   β={beta}'
 mpi.report('=' * 70 + '\n')
 
 # h_int = make_h_int_kanamori_simple(U, U, J, J, norb=norb)
-# h_int = make_h_int_kanamori_simple(U, U - 2*J, J, 0, norb=norb)
-h_int = make_h_int_kanamori_simple(U, U - 2*J, J, J, norb=norb) # this can generate a goldstone mode without crystal field
+h_int = make_h_int_kanamori_simple(U, U - 2*J, J, 0, norb=norb)
+# h_int = make_h_int_kanamori_simple(U, U - 2*J, J, J, norb=norb) # this can generate a goldstone mode without crystal field
 
 # ── Crystal field (optional) ─────────────────────────────────────────────────
 # Diagonal on-site energies per spin block, passed to both DMFT loops.
@@ -200,10 +200,10 @@ mpi.report('=' * 70 + '\n')
 # )
 
 dm_proposals = DensityMatrixProposals(
-    n_proposals       = 100,
-    n_targeting_steps = 50,
-    targeting_alpha   = 0.5,
-    # targeting_alpha   = 2.0,
+    n_proposals       = 50,
+    n_targeting_steps = 30,
+    # targeting_alpha   = 0.5,
+    targeting_alpha   = 2.0,
     half_occ_prob     = 0.2,
     force_real        = True,
     # Explicit Hund's m=2 targets — all three orbital permutations of [1,1,0]/[0,0,0].
@@ -444,7 +444,7 @@ ens_dmft_result = dmft_loop_ensemble_hf(
     n_elec_total    = n_target,
     max_iter        = 20,
     eps             = 1e-3,
-    mix             = 0.7,
+    mix             = 0.3,
     adjust_mu       = True,
     mu_bracket      = 55.0,
     crystal_field   = crystal_field,
