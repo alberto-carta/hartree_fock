@@ -129,12 +129,84 @@ def pm_kick(norb: int, gf_struct: list) -> dict:
             'sigma': {bl: np.zeros((norb, norb)) for bl in blocks}}
 
 
+def orbital_symmetry_projector(equiv_groups: list, gf_struct: list):
+    """Return a callable that symmetry-averages Σ_HF and G_iw over equivalent orbitals.
+
+    For each pair of equivalence classes (A, B), all matrix elements M[a,b]
+    with a∈A, b∈B are replaced by their mean.  Within the same class, diagonal
+    elements are averaged separately from off-diagonal elements.
+
+    This projects both the self-energy and the Green's function onto the
+    subspace invariant under all permutations of each equivalence class,
+    removing symmetry-breaking fluctuations and steering the DMFT loop toward
+    saddle points or maxima that live on the symmetric manifold.
+
+    Parameters
+    ----------
+    equiv_groups : list of lists of int
+        Groups of orbitally equivalent indices.
+        Example: ``[[0, 1, 2], [3, 4]]`` for a 5-orbital d-shell with
+        t2g orbitals (0-2) and eg orbitals (3-4) separately degenerate.
+        Orbitals not listed form singleton groups and are left unchanged.
+    gf_struct    : list of (block_name, norb) pairs
+
+    Returns
+    -------
+    callable : ``proj(solver) -> None`` with ``modifies_G = True``
+        Modifies ``solver.Sigma_HF`` and ``solver.G_iw`` in-place.
+    """
+    blocks = [bl for bl, _ in gf_struct]
+    norb   = gf_struct[0][1]
+
+    # Complete partition: add singletons for orbitals not in any group
+    all_in = set(o for g in equiv_groups for o in g)
+    all_groups = list(equiv_groups) + [[o] for o in range(norb) if o not in all_in]
+
+    def _project_matrix(M):
+        M_out = M.copy()
+        for gi, grp_i in enumerate(all_groups):
+            for gj, grp_j in enumerate(all_groups):
+                if gi == gj:
+                    # same class: average diagonal and off-diagonal separately
+                    d_avg = np.mean([M[a, a] for a in grp_i])
+                    for a in grp_i:
+                        M_out[a, a] = d_avg
+                    if len(grp_i) > 1:
+                        od_avg = np.mean([M[a, b] for a in grp_i
+                                          for b in grp_j if a != b])
+                        for a in grp_i:
+                            for b in grp_j:
+                                if a != b:
+                                    M_out[a, b] = od_avg
+                else:
+                    # cross-class: average all elements
+                    avg = np.mean([M[a, b] for a in grp_i for b in grp_j])
+                    for a in grp_i:
+                        for b in grp_j:
+                            M_out[a, b] = avg
+        return M_out
+
+    def _proj(solver):
+        # Project Σ_HF
+        for bl in blocks:
+            solver.Sigma_HF[bl] = _project_matrix(solver.Sigma_HF[bl])
+        # Project G_iw frequency-by-frequency
+        n_pts = solver.G_iw[blocks[0]].data.shape[0]
+        for bl in blocks:
+            for i in range(n_pts):
+                solver.G_iw[bl].data[i] = _project_matrix(
+                    solver.G_iw[bl].data[i])
+
+    _proj.modifies_G   = True   # signals: skip _update_G_iw after this
+    _proj.equiv_groups = equiv_groups
+    return _proj
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Pretty-print helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
 _LW = 70  # default line-width for decorative rules
-
 
 def _rule(char: str = '─', n: int = _LW) -> str:
     return char * n
@@ -161,7 +233,8 @@ def _mat_lines(M: np.ndarray, name: str, lbl: str) -> list:
 
 def _print_run_header(i_run: int, n_total: int, kick: dict,
                       n_target_steps: int = 0,
-                      targeting_alpha: float = 0.0) -> None:
+                      targeting_alpha: float = 0.0,
+                      sym_active: bool = False) -> None:
     r = mpi.report
     r('\n' + _rule('═'))
     if kick['type'] == 'dm':
@@ -188,6 +261,11 @@ def _print_run_header(i_run: int, n_total: int, kick: dict,
                 diag_s = _vfmt(mat.diagonal())
                 r(f'  Σ_init  {bl:4s}  eigs = {eigs_s}')
                 r(f'          {bl:4s}  diag = {diag_s}')
+    if sym_active:
+        proj_fn = kick.get('sym_proj', None)
+        grps    = getattr(proj_fn, 'equiv_groups', None)
+        grp_str = f'  groups={grps}' if grps is not None else '  (spin average)'
+        r(f'  ● Symmetry projection ACTIVE every iteration —{grp_str}')
     r(_rule('─'))
 
 
@@ -309,9 +387,12 @@ def dmft_loop_targeted(
         spin_kick = None,
         crystal_field: dict | None = None,
         print_every: int = 20,
+        sym_proj = None,
+        p_sym: float = 0.0,
+        sym_seed: int = 0,
         **solver_kwargs,
 ) -> dict:
-    """Bethe-lattice DMFT loop with optional DM targeting.
+    """Bethe-lattice DMFT loop with optional DM targeting and symmetry projection.
 
     All HF-solver output is silenced; structured per-iteration diagnostics
     are printed via ``mpi.report``.
@@ -326,6 +407,14 @@ def dmft_loop_targeted(
     spin_kick      : Initial Σ_HF (dict or float scalar).  Only used when
                      ``rho_target`` is None (Sobol mode).
     print_every    : Print a diagnostics line every this many release iterations.
+    sym_proj       : callable ``sym_proj(solver) -> None`` that projects
+                     Σ_HF (and optionally G_iw) in-place onto a symmetry
+                     subspace (e.g. ``orbital_symmetry_projector(...)``).  Applied
+                     stochastically after mixing with probability ``p_sym``.
+                     Use ``p_sym=1.0`` to always enforce (finds saddle points);
+                     ``p_sym=0.0`` (default) disables entirely.
+    p_sym          : Probability of applying ``sym_proj`` per DMFT iteration.
+    sym_seed       : RNG seed for the stochastic symmetry draws.
 
     Returns
     -------
@@ -411,6 +500,8 @@ def dmft_loop_targeted(
     converged = False
     n_consec  = 0
     is_tgt    = rho_target is not None
+    _sym_rng  = np.random.default_rng(sym_seed)
+    _do_sym   = (sym_proj is not None) and (p_sym > 0.0)
 
     for it in range(max_iter):
         phase         = ('target' if (is_tgt and it < n_target_steps) else 'release')
@@ -449,7 +540,16 @@ def dmft_loop_targeted(
                                        + (1.0 - mix) * Sigma_old[bl])
             _update_G_iw()
 
-        # ── 4b. Targeting correction (targeting phase only) ───────────────
+        # ── 4b. Symmetry projection (any phase) ──────────────────────────────
+        if _do_sym and _sym_rng.random() < p_sym:
+            sym_proj(solver)
+            # If the projector also symmetrized G_iw directly, skip
+            # _update_G_iw (G is already enforced).  Sigma-only projectors
+            # (modifies_G=False) need _update_G_iw to propagate to G.
+            if not getattr(sym_proj, 'modifies_G', False):
+                _update_G_iw()
+
+        # ── 4c. Targeting correction (targeting phase only) ───────────────
         drho_max = 0.0
         if phase == 'target':
             for bl in blocks:
@@ -631,6 +731,18 @@ def run_landscape(
                           n_target_steps=n_target_steps,
                           targeting_alpha=targeting_alpha)
 
+        # Symmetry projection: draw ONCE per run so the decision is
+        # consistent across all iterations of this run.
+        _sym_proj_fn = kick.get('sym_proj', None)
+        _p_sym_kick  = kick.get('p_sym',    0.0)
+        _run_sym     = (_sym_proj_fn is not None and _p_sym_kick > 0.0
+                        and np.random.default_rng(i + 99991).random() < _p_sym_kick)
+
+        _print_run_header(i + 1, n_total, kick,
+                          n_target_steps=n_target_steps,
+                          targeting_alpha=targeting_alpha,
+                          sym_active=_run_sym)
+
         if kick['type'] == 'sobol':
             result = dmft_loop_targeted(
                 solver, t, h_int, mu_init, n_target,
@@ -640,6 +752,8 @@ def run_landscape(
                 targeting_alpha = targeting_alpha,
                 crystal_field  = crystal_field,
                 print_every    = print_every,
+                sym_proj       = _sym_proj_fn if _run_sym else None,
+                p_sym          = 1.0 if _run_sym else 0.0,
                 **dmft_kwargs,
             )
         else:  # 'dm'
@@ -651,6 +765,8 @@ def run_landscape(
                 targeting_alpha = targeting_alpha,
                 crystal_field  = crystal_field,
                 print_every    = print_every,
+                sym_proj       = _sym_proj_fn if _run_sym else None,
+                p_sym          = 1.0 if _run_sym else 0.0,
                 **dmft_kwargs,
             )
 

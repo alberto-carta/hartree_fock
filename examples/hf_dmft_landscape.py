@@ -36,6 +36,7 @@ from hf_dmft_landscape_backend import (
     pm_kick,
     run_landscape,
     load_runs,
+    orbital_symmetry_projector,
 )
 
 plt.rcParams.update({'font.size': 12})
@@ -51,15 +52,15 @@ eps_dlr = 1e-13
 norb     = 5
 n_target = 5       # total filling (summed over spin and orbital)
 
-U = 5.0
-J = 0.4
+U = 3.5
+J = 0.3
 
 
 
 
 
 # Crystal field: t2g (orbs 0-2) vs e_g (orbs 3-4), with small orbital splittings
-cf_mag = 0.5
+cf_mag = 1
 cf_t2g = -2/5 * cf_mag
 cf_eg  =  3/5 * cf_mag
 
@@ -116,6 +117,18 @@ kicks = (
 mpi.report(f'  Total kicks: {len(kicks)}'
            f'  (1 PM + {N_sobol} Sobol + {N_dm} DM-targeted)')
 
+# ── Orbital symmetry projector ─────────────────────────────────────────────────────
+# t2g (orbitals 0-2) and eg (orbitals 3-4) are each internally equivalent.
+# Each run has probability p_sym of enforcing orbital symmetry at EVERY
+# iteration, steering it toward the orbitally-symmetric saddle points.
+# Set p_sym=0.0 to disable, p_sym=1.0 to enforce in all runs.
+equiv_groups = [[0, 1 ,2], [3, 4]] # in tm oxides the middle t2g is in the direction of the other atom so inequivalent
+p_sym        = 0.5
+orb_proj     = orbital_symmetry_projector(equiv_groups, gf_struct)
+for k in kicks:
+    k['sym_proj'] = orb_proj
+    k['p_sym']    = p_sym
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Output paths
@@ -143,7 +156,7 @@ dmft_kwargs = dict(
     mu_bracket = 30.0,
     with_fock  = True,
     one_shot   = True,
-    method     = 'hybr',
+    method     = 'krylov',
     # tol        = 1e-5,
     print_every = 20,
 )
@@ -214,15 +227,27 @@ mpi.report('═' * 70 + '\n')
 runs = load_runs(archive_path)
 with __import__('h5').HDFArchive(archive_path, 'r') as _ar:
     _p = _ar['params']
-F_min = runs[0]['F']
 
 F_arr    = np.array([r['F']       for r in runs])
+F_min     = F_arr.min()
 Fint_arr = np.array([r['F_int']   for r in runs])
 Fkin_arr = np.array([r['F_kin']   for r in runs])
 dF_arr   = F_arr - F_min
 dFint_arr = Fint_arr - Fint_arr.min()
 m_arr    = np.array([r['m']       for r in runs])
 n_arr    = np.array([r['n_total'] for r in runs])
+
+# for every run get the magnetization inverted twin, create new arrays and concatenate to the original ones, then sort by energy. This is just for visualisation purposes, it doesn't mean that the twin solutions are actually found by the solver (they are not, in general).
+F_arr    = np.concatenate([F_arr, F_arr])
+Fint_arr = np.concatenate([Fint_arr, Fint_arr])
+Fkin_arr = np.concatenate([Fkin_arr, Fkin_arr])
+dF_arr   = np.concatenate([dF_arr, dF_arr])
+dFint_arr = np.concatenate([dFint_arr, dFint_arr])
+# dFkin_arr = np.concatenate([dFkin_arr, dFkin_arr])
+m_arr    = np.concatenate([m_arr, -m_arr])
+n_arr    = np.concatenate([n_arr, n_arr])
+
+
 
 title = (f'HF-DMFT landscape  |  norb={_p["norb"]}  U={_p["U"]}'
          f'  J={_p["J"]}  β={_p["beta"]}  cf={_p["cf_mag"]}'

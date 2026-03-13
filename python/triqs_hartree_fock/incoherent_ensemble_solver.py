@@ -92,7 +92,9 @@ class Solution:
     G_iw:            object = field(repr=False)   # BlockGf
     Sigma_HF:        dict   = field(repr=False)   # {block: ndarray}
     density:         dict   = field(repr=False)   # {block: ndarray}
-    free_energy:     float  = field(default=0.0)
+    free_energy:     float  = field(default=0.0)  # F = E_int + E_kin
+    free_energy_int: float  = field(default=0.0)  # E_int = ½ Tr[Σ·ρ]
+    free_energy_kin: float  = field(default=0.0)  # E_kin = (1/β) Σ Tr[ln(iωG)]
     weight:          float  = field(default=0.0)
     magnetisation:   float  = field(default=0.0)
     n_total:         float  = field(default=0.0)
@@ -155,12 +157,15 @@ class SolutionSet:
 
         # column widths
         W_i, W_F, W_m, W_N, W_w = 6, 14, 12, 9, 9
+        W_Fc = 11   # F_int / F_kin column width
         ev_w = max(8, norb * 7)          # eigenvalue columns
-        sep  = ('─' * W_i + '┼' + '─' * W_F + '┼' + '─' * W_m +
-                '┼' + '─' * W_N + '┼' + '─' * W_w +
+        sep  = ('─' * W_i + '┼' + '─' * W_F + '┼' + '─' * W_Fc + '┼' + '─' * W_Fc +
+                '┼' + '─' * W_m + '┼' + '─' * W_N + '┼' + '─' * W_w +
                 '┼' + '─' * ev_w + '┼' + '─' * ev_w)
         hdr  = (f"{'#':>{W_i-1}} "
                 f"│ {'F':>{W_F-2}} "
+                f"│ {'F_int':>{W_Fc-2}} "
+                f"│ {'F_kin':>{W_Fc-2}} "
                 f"│ {'m':>{W_m-2}} "
                 f"│ {'N':>{W_N-2}} "
                 f"│ {'weight':>{W_w-2}} "
@@ -180,6 +185,8 @@ class SolutionSet:
             lines.append(
                 f"{i:>{W_i-2}}{tag} "
                 f"│ {sol.free_energy:>{W_F-2}.6f} "
+                f"│ {sol.free_energy_int:>{W_Fc-2}.5f} "
+                f"│ {sol.free_energy_kin:>{W_Fc-2}.5f} "
                 f"│ {sol.magnetisation:>{W_m-2}.5f} "
                 f"│ {sol.n_total:>{W_N-2}.4f} "
                 f"│ {sol.weight:>{W_w-2}.5f} "
@@ -248,10 +255,12 @@ class SolutionSet:
             rho = sol.density
             sig = sol.Sigma_HF
             row = dict(
-                free_energy   = sol.free_energy,
-                magnetisation = sol.magnetisation,
-                n_total       = sol.n_total,
-                weight        = sol.weight,
+                free_energy     = sol.free_energy,
+                free_energy_int = sol.free_energy_int,
+                free_energy_kin = sol.free_energy_kin,
+                magnetisation   = sol.magnetisation,
+                n_total         = sol.n_total,
+                weight          = sol.weight,
             )
             for a in range(norb):
                 row[f'n_up_{a}']       = float(rho['up'][a, a])   if 'up'   in rho else float('nan')
@@ -735,14 +744,16 @@ class IncoherentEnsembleSolver:
         # ── Build SolutionSet ──────────────────────────────────────────────
         self.solutions = SolutionSet([
             Solution(
-                G_iw            = gf,
-                Sigma_HF        = sig,
-                density         = rec['density'],
-                free_energy     = rec['free_energy'],
-                weight          = w,
-                magnetisation   = rec['magnetisation'],
-                n_total         = rec['n_total'],
-                _proposal_index = rec['proposal_index'],
+                G_iw             = gf,
+                Sigma_HF         = sig,
+                density          = rec['density'],
+                free_energy      = rec['free_energy'],
+                free_energy_int  = rec['free_energy_int'],
+                free_energy_kin  = rec['free_energy_kin'],
+                weight           = w,
+                magnetisation    = rec['magnetisation'],
+                n_total          = rec['n_total'],
+                _proposal_index  = rec['proposal_index'],
             )
             for rec, gf, sig, w in zip(records, green_funcs, sigma_hfs, weights)
         ])                                    # SolutionSet sorts by F internally
@@ -783,14 +794,16 @@ class IncoherentEnsembleSolver:
         ])
         magnetisation = float(np.sum(m_per_orb))
 
-        free_energy = _impurity_free_energy(solver)
+        free_energy, E_int, E_kin = _impurity_free_energy_components(solver)
 
         rec = {
-            'proposal_index': idx,
-            'free_energy'   : free_energy,
-            'magnetisation' : magnetisation,
-            'n_total'       : n_tot,
-            'weight'        : 0.0,   # filled in after all solutions known
+            'proposal_index'  : idx,
+            'free_energy'     : free_energy,
+            'free_energy_int' : E_int,
+            'free_energy_kin' : E_kin,
+            'magnetisation'   : magnetisation,
+            'n_total'         : n_tot,
+            'weight'          : 0.0,   # filled in after all solutions known
         }
         rec['density'] = rho
         return rec
@@ -1129,13 +1142,16 @@ def _targeting_step(
 SaddlePoint = Solution
 
 
-def _impurity_free_energy(solver: ImpuritySolver) -> float:
-    """Impurity free energy for a converged HF solution.
+def _impurity_free_energy_components(solver: ImpuritySolver) -> tuple:
+    """Decomposed impurity free energy for a converged HF solution.
 
-    F = E_int + E_kin
+    Returns
+    -------
+    (F_total, E_int, E_kin) : tuple of float
 
-    E_int = ½ Tr[Σ_int · ρ]   (exact HF interaction energy)
-    E_kin = (1/β) Σ_{iω} Tr[ ln(iω · G(iω)) ]
+    F_total = E_int + E_kin
+    E_int   = ½ Tr[Σ_int · ρ]   (exact HF interaction energy)
+    E_kin   = (1/β) Σ_{iω} Tr[ ln(iω · G(iω)) ]  (kinetic / bath term)
 
     The kinetic term is computed on the DLR mesh by applying
     scipy.linalg.logm frequency-by-frequency to the product iω·G(iω).
@@ -1144,7 +1160,7 @@ def _impurity_free_energy(solver: ImpuritySolver) -> float:
     At fixed G0, only differences ΔF between saddle points enter the
     Boltzmann weights, so any additive constant is irrelevant.
     """
-    E_int = solver.interaction_energy()
+    E_int = float(np.real(solver.interaction_energy()))
 
     G_iw    = solver.G_iw
     prodlog = G_iw.copy()
@@ -1162,5 +1178,12 @@ def _impurity_free_energy(solver: ImpuritySolver) -> float:
                 prodlog[bl].data[i] = logm(prod[bl].data[i])
 
     E_kin = float(np.real(prodlog.total_density()))
+    return float(E_int + E_kin), E_int, E_kin
 
-    return float(np.real(E_int + E_kin))
+
+def _impurity_free_energy(solver: ImpuritySolver) -> float:
+    """Impurity free energy F = E_int + E_kin (scalar).
+
+    For the individual components see :func:`_impurity_free_energy_components`.
+    """
+    return _impurity_free_energy_components(solver)[0]
